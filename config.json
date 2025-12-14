@@ -1,0 +1,11 @@
+{
+  "sftp_config": {
+    "host": "leda.whatbox.ca",
+    "port": 22,
+    "username": "system76rjr",
+    "password": "J013n3831g@1",
+    "private_key_path": null
+  },
+  "download_threshold": 0,
+  "local_download_path": "/home/rhonaldjr/Documents"
+}

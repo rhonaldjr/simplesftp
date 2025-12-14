@@ -1,0 +1,15 @@
+[package]
+name = "simplesftp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio", "advanced", "canvas", "image"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+rfd = "0.15"
+once_cell = "1.19"
+ssh2 = "0.9"
+chrono = "0.4"
