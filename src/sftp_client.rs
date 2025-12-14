@@ -90,8 +90,12 @@ impl SftpClient {
                         "".to_string()
                     };
 
+                    let full_path = canonical_path.join(&filename);
+                    let full_path_str = full_path.to_string_lossy().to_string();
+
                     remote_files.push(RemoteFile {
                         name: filename,
+                        path: full_path_str,
                         size,
                         file_type,
                         modified,
@@ -114,5 +118,66 @@ impl SftpClient {
             }
             Err(e) => Err(format!("SFTP Error: {}", e)),
         }
+    }
+
+    pub fn recursive_scan(&self, path: &Path) -> Result<Vec<RemoteFile>, String> {
+        let mut all_files = Vec::new();
+        let canonical_path = self
+            .sftp
+            .realpath(path)
+            .map_err(|e| format!("Canonicalization failed: {}", e))?;
+
+        let mut stack = vec![canonical_path];
+
+        while let Some(current_path) = stack.pop() {
+            if let Ok(entries) = self.sftp.readdir(&current_path) {
+                for (path, stat) in entries {
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if filename == "." || filename == ".." {
+                        continue;
+                    }
+
+                    let size = if stat.is_dir() {
+                        "".to_string()
+                    } else {
+                        format!("{}", stat.size.unwrap_or(0))
+                    };
+                    let file_type = if stat.is_dir() {
+                        FileType::Folder
+                    } else {
+                        FileType::File
+                    };
+
+                    let modified = if let Some(mtime) = stat.mtime {
+                        if let Some(dt) = chrono::DateTime::from_timestamp(mtime as i64, 0) {
+                            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                        } else {
+                            "".to_string()
+                        }
+                    } else {
+                        "".to_string()
+                    };
+
+                    let remote_file = RemoteFile {
+                        name: filename,
+                        path: path.to_string_lossy().to_string(),
+                        size,
+                        file_type: file_type.clone(),
+                        modified,
+                    };
+
+                    if file_type == FileType::Folder {
+                        stack.push(path);
+                    } else {
+                        all_files.push(remote_file);
+                    }
+                }
+            }
+        }
+        Ok(all_files)
     }
 }

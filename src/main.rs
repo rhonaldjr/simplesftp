@@ -5,8 +5,8 @@ mod sftp_client;
 mod style;
 
 use iced::widget::{
-    button, column, container, horizontal_space, pane_grid, row, scrollable, stack, text,
-    text_input, vertical_space,
+    button, column, container, horizontal_space, mouse_area, pane_grid, row, scrollable, stack,
+    text, text_input, vertical_space,
 };
 use iced::{Element, Length, Task, Theme};
 use mock_data::{FileType, QueueItem, RemoteFile};
@@ -40,6 +40,9 @@ struct SftpApp {
     queue_items: Vec<QueueItem>,
     remote_files: Vec<RemoteFile>,
     current_remote_path: String,
+    // Context Menu
+    context_menu: Option<RemoteFile>,
+    is_scanning_queue: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,9 +72,11 @@ impl Default for SftpApp {
             sftp_client: None,
             selected_file: None,
             last_click: None,
-            queue_items: mock_data::generate_mock_queue(),
+            queue_items: Vec::new(),
             remote_files: Vec::new(),
             current_remote_path: ".".into(), // Start at home/current directory
+            context_menu: None,
+            is_scanning_queue: false,
         }
     }
 }
@@ -101,6 +106,10 @@ enum Message {
     // Local Navigation
     SelectDownloadPath,
     DownloadPathSelected(Option<std::path::PathBuf>),
+    // Context Menu
+    RemoteFileRightClicked(RemoteFile),
+    ContextOptionSelected(ContextOption),
+    ScanResult(Result<Vec<RemoteFile>, String>),
     // Pane
     PaneResized(pane_grid::ResizeEvent),
     // Toolbar
@@ -114,6 +123,12 @@ enum ConfigOption {
     Minimize,
     Disconnect,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ContextOption {
+    Download,
+    Dismiss,
 }
 
 impl SftpApp {
@@ -254,6 +269,66 @@ impl SftpApp {
                     }
                 }
             }
+            Message::RemoteFileRightClicked(file) => {
+                // Removed point
+                self.context_menu = Some(file);
+            }
+            Message::ContextOptionSelected(option) => {
+                if let Some(file) = self.context_menu.take() {
+                    // Removed point from destructuring
+                    match option {
+                        ContextOption::Download => {
+                            if let Some(client) = &self.sftp_client {
+                                let client = client.clone();
+                                self.is_scanning_queue = true;
+
+                                return Task::future(async move {
+                                    let path = std::path::Path::new(&file.path).to_path_buf();
+
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        let c = client.lock().unwrap();
+                                        if file.file_type == FileType::Folder {
+                                            c.recursive_scan(&path)
+                                        } else {
+                                            Ok(vec![file])
+                                        }
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(e.to_string()));
+
+                                    Message::ScanResult(res)
+                                });
+                            }
+                        }
+                        ContextOption::Dismiss => {
+                            // Do nothing, just close the menu
+                        }
+                    }
+                }
+            }
+            Message::ScanResult(result) => {
+                self.is_scanning_queue = false;
+                match result {
+                    Ok(files) => {
+                        for file in files {
+                            if !self.queue_items.iter().any(|i| i.remote_file == file.path) {
+                                self.queue_items.push(QueueItem {
+                                    local_location: self.config.local_download_path.clone(),
+                                    filename: file.name,
+                                    remote_file: file.path,
+                                    downloaded: "0B".into(),
+                                    remaining: file.size,
+                                    priority: 10,
+                                    progress: "Pending".into(),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.app_error = Some(format!("Scan failed: {}", e));
+                    }
+                }
+            }
             Message::GoToParent => {
                 if let Some(client) = &self.sftp_client {
                     let client = client.clone();
@@ -314,11 +389,59 @@ impl SftpApp {
     fn view(&self) -> Element<'_, Message> {
         let main_view = self.view_main();
 
-        if self.state == AppState::SettingsView {
+        let root = if self.state == AppState::SettingsView {
             stack![main_view, self.view_settings()].into()
         } else {
             main_view
+        };
+
+        if let Some(file) = &self.context_menu {
+            // Updated to directly use file
+            let menu = container(
+                column![
+                    text(format!("Selected: {}", file.name)).size(14),
+                    self.context_menu_view()
+                ]
+                .spacing(10)
+                .padding(10),
+            )
+            .style(style::pane_style) // Use a styled container for the menu box
+            .width(Length::Shrink)
+            .height(Length::Shrink)
+            .padding(20);
+
+            // Backdrop to close menu
+            let backdrop = button(text(" "))
+                .on_press(Message::ContextOptionSelected(ContextOption::Dismiss)) // Changed to Dismiss
+                .style(button::text) // Transparent-ish
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+            stack![
+                root,
+                backdrop,
+                container(menu)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
+            ]
+            .into()
+        } else {
+            root
         }
+    }
+
+    fn context_menu_view(&self) -> Element<'_, Message> {
+        container(
+            button(text("Download").size(14))
+                .on_press(Message::ContextOptionSelected(ContextOption::Download))
+                .padding(5)
+                .style(button::secondary),
+        )
+        .padding(5)
+        .style(style::header_style)
+        .into()
     }
 
     fn view_main(&self) -> Element<'_, Message> {
@@ -373,9 +496,27 @@ impl SftpApp {
         .on_resize(10, Message::PaneResized);
 
         // Status Bar
-        let status_bar = container(
-            text("Total connections: 2, Total Queued: 18 (674 GB), Total Downloaded: 72 (1.6TB), Speed: 20Mbps").size(12)
-        ).padding(5).style(style::header_style);
+        let total_queued = self.queue_items.len();
+        let total_bytes: u64 = self
+            .queue_items
+            .iter()
+            .map(|i| i.remaining.parse::<u64>().unwrap_or(0))
+            .sum();
+        let total_size_str = self.format_bytes(&total_bytes.to_string());
+
+        let scanning_text = if self.is_scanning_queue {
+            " | Scanning..."
+        } else {
+            ""
+        };
+        let status_text = format!(
+            "Total Queued: {} ({}){}",
+            total_queued, total_size_str, scanning_text
+        );
+
+        let status_bar = container(text(status_text).size(12))
+            .padding(5)
+            .style(style::header_style);
 
         let base_content = column![
             container(menu_bar).style(style::header_style),
@@ -464,7 +605,7 @@ impl SftpApp {
                         item.filename.clone(),
                         item.remote_file.clone(),
                         item.downloaded.clone(),
-                        item.remaining.clone(),
+                        self.format_bytes(&item.remaining),
                         item.priority.to_string(),
                         item.progress.clone(),
                     ])
@@ -542,7 +683,7 @@ impl SftpApp {
                     ]
                     .spacing(5);
 
-                    button(container(row_content).padding(5))
+                    let btn = button(container(row_content).padding(5))
                         .on_press(Message::RemoteFileClicked(file.clone()))
                         .width(Length::Fill)
                         .style(move |_thread, _status| {
@@ -558,7 +699,10 @@ impl SftpApp {
                                     ..button::text(_thread, _status)
                                 }
                             }
-                        })
+                        });
+
+                    mouse_area(btn)
+                        .on_right_press(Message::RemoteFileRightClicked(file.clone())) // Removed closure and point
                         .into()
                 })
                 .collect::<Vec<_>>(),
@@ -651,5 +795,26 @@ impl SftpApp {
             ..Default::default()
         })
         .into()
+    }
+
+    fn format_bytes(&self, size_str: &str) -> String {
+        let size = size_str
+            .trim()
+            .replace(" B", "")
+            .parse::<u64>()
+            .unwrap_or(0);
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+
+        if size >= GB {
+            format!("{:.2} GB", size as f64 / GB as f64)
+        } else if size >= MB {
+            format!("{:.2} MB", size as f64 / MB as f64)
+        } else if size >= KB {
+            format!("{:.2} KB", size as f64 / KB as f64)
+        } else {
+            format!("{} B", size)
+        }
     }
 }

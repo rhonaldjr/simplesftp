@@ -18,6 +18,7 @@ pub enum FileType {
 #[derive(Debug, Clone)]
 pub struct RemoteFile {
     pub name: String,
+    pub path: String,
     pub size: String,
     pub file_type: FileType,
     pub modified: String,
@@ -51,24 +52,28 @@ pub fn generate_mock_remote_files() -> Vec<RemoteFile> {
     vec![
         RemoteFile {
             name: "..".into(),
+            path: "/mnt/movies".into(), // Mock path
             size: "".into(),
             file_type: FileType::Folder,
             modified: "".into(),
         },
         RemoteFile {
             name: "files".into(),
+            path: "/mnt/movies/files".into(),
             size: "".into(),
             file_type: FileType::Folder,
             modified: "2023-01-01 12:00:00".into(),
         },
         RemoteFile {
             name: "Lost.in.Space.2018.S02E01.720p.NF.WEBRip...".into(),
+            path: "/mnt/movies/Lost.in.Space.2018.S02E01.720p.NF.WEBRip...".into(),
             size: "80MB".into(),
             file_type: FileType::File,
             modified: "2023-10-27 09:30:00".into(),
         },
         RemoteFile {
             name: "config.txt".into(),
+            path: "/mnt/movies/config.txt".into(),
             size: "2KB".into(),
             file_type: FileType::File,
             modified: "2023-11-05 15:45:00".into(),
