@@ -1,6 +1,25 @@
 use crate::mock_data::{FileType, RemoteFile};
 use crate::settings::SftpConfig;
 
+const KB: u64 = 1024;
+const MB: u64 = KB * 1024;
+const GB: u64 = MB * 1024;
+const TB: u64 = GB * 1024;
+
+fn format_size(size: u64) -> String {
+    if size >= TB {
+        format!("{:.2} TB", size as f64 / TB as f64)
+    } else if size >= GB {
+        format!("{:.2} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.2} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.2} KB", size as f64 / KB as f64)
+    } else {
+        format!("{} B", size)
+    }
+}
+
 use ssh2::{Session, Sftp};
 use std::fmt;
 use std::net::TcpStream;
@@ -72,7 +91,7 @@ impl SftpClient {
                     let size = if stat.is_dir() {
                         "".to_string()
                     } else {
-                        format!("{} B", stat.size.unwrap_or(0))
+                        format_size(stat.size.unwrap_or(0))
                     };
                     let file_type = if stat.is_dir() {
                         FileType::Folder
@@ -144,7 +163,7 @@ impl SftpClient {
                     let size = if stat.is_dir() {
                         "".to_string()
                     } else {
-                        format!("{}", stat.size.unwrap_or(0))
+                        format_size(stat.size.unwrap_or(0))
                     };
                     let file_type = if stat.is_dir() {
                         FileType::Folder
