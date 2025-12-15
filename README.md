@@ -10,16 +10,28 @@
 | **Connection Manager** | ✅ Implemented | Connect via Host, Port, Username, and Password. Settings are persisted. |
 | **Remote Browser** | ✅ Implemented | "FileZilla-like" detailed view (Name, Size, Type, Modified). |
 | **Navigation** | ✅ Implemented | Double-click to enter folders or go up (`..`). Includes path canonicalization. |
-| **Download Queue** | 🚧 In Progress | UI implemented with mock data. Real download logic coming soon. |
-| **Local Browser** | 📅 Planned | Currently using placeholder UI. |
-| **File Transfers** | 📅 Planned | Upload and Download functionality to be integrated. |
+| **Download Queue** | ✅ Implemented | Queue items added via context menu. Recursive scanning supported. |
+| **Context Menu** | ✅ Implemented | Right-click overlay with "Download" option and recursive folder scanning. |
+| **Target Selection** | ✅ Implemented | Choose local download destination via native dialog. |
+| **File Transfers** | 📅 Planned | Actual file transfer logic (downloading queue items) to be implemented. |
+| **Pause and Resume Downloads** | 📅 Planned | The ability to pause and resume downloads. |
+| **Throttle Downloads** | 📅 Planned | The ability to limit the download speed |
+| **Scheduling** | 📅 Planned | The ability to schedule downloads |
+| **Detect Media Type** | 📅 Planned | Detect the media type and then pick up the appropriate download folders |
+| **File Cleanup** | 📅 Planned | Review the filenames, folder structures and perform cleanup to be consistent with the media type |
+| **Local Browser** | 📅 Planned | Full local file browser integration. |
 
 ## Roadmap
 
-*   **Phase 1 (Current)**: Core UI, authenticating with SFTP servers, and robust remote directory browsing.
-*   **Phase 2**: Implementing the **Download Queue**, allowing files to be added and transferred asynchronously.
-*   **Phase 3**: **Local File Browser** integration for full drag-and-drop support.
-*   **Phase 4**: Advanced transfer features (Pause, Resume, Recursive directory downloads).
+*   **Phase 1 (Completed)**: Core UI, authenticating with SFTP servers, and robust remote directory browsing.
+*   **Phase 2 (Completed)**: **Context Menu & Queueing**:
+    *   Right-click "Download" support.
+    *   Recursive directory scanning.
+    *   Target folder selection.
+    *   Queue management (Deduplication, Statistics).
+*   **Phase 3**: **File Transfer Logic**: Implementing the asynchronous download engine to process the queue.
+*   **Phase 4**: **Local File Browser** integration for drag-and-drop support.
+*   **Phase 5**: Advanced transfer features (Pause, Resume, Scheduling).
 
 ## How to Run
 

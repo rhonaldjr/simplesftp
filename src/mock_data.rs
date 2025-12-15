@@ -24,29 +24,6 @@ pub struct RemoteFile {
     pub modified: String,
 }
 
-pub fn generate_mock_queue() -> Vec<QueueItem> {
-    vec![
-        QueueItem {
-            local_location: ".../Animations".into(),
-            filename: "Lost.in.Space.2018.S02E01.720p.WEB...".into(),
-            remote_file: "Lost.in.Space.2018.S02E01.720p.NF...".into(),
-            downloaded: "20MB".into(),
-            remaining: "80MB".into(),
-            priority: 10,
-            progress: "In Progress".into(),
-        },
-        QueueItem {
-            local_location: ".../Movies".into(),
-            filename: "Matrix.1999.1080p.mkv".into(),
-            remote_file: "Matrix.1999.1080p.mkv".into(),
-            downloaded: "0MB".into(),
-            remaining: "2.5GB".into(),
-            priority: 5,
-            progress: "Pending".into(),
-        },
-    ]
-}
-
 #[allow(dead_code)]
 pub fn generate_mock_remote_files() -> Vec<RemoteFile> {
     vec![
