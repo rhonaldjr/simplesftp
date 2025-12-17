@@ -204,8 +204,6 @@ impl SftpClient {
         Ok(all_files)
     }
 
-    /// Download a chunk of a remote file starting at the given offset.
-    /// Returns the number of bytes read (0 means EOF).
     pub fn download_chunk(
         &self,
         remote_path: &Path,
@@ -254,5 +252,24 @@ impl SftpClient {
             .map_err(|e| format!("Failed to write to local file: {}", e))?;
 
         Ok(bytes_read)
+    }
+
+    pub fn remove(&self, path: &Path) -> Result<(), String> {
+        // Try to remove as file first, then as directory
+        // Alternatively check stat first
+        let stat = self
+            .sftp
+            .stat(path)
+            .map_err(|e| format!("Failed to stat path: {}", e))?;
+
+        if stat.is_dir() {
+            self.sftp
+                .rmdir(path)
+                .map_err(|e| format!("Failed to remove directory: {}", e))
+        } else {
+            self.sftp
+                .unlink(path)
+                .map_err(|e| format!("Failed to remove file: {}", e))
+        }
     }
 }

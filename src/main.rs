@@ -1,20 +1,25 @@
 mod components;
 mod download_manager;
 mod mock_data;
+mod scheduler;
 mod settings;
 mod sftp_client;
 mod style;
+mod tray;
 
 use download_manager::{DownloadCommand, DownloadEvent};
 use iced::widget::{
-    button, column, container, horizontal_space, mouse_area, pane_grid, row, scrollable, stack,
-    text, text_input, vertical_space,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, mouse_area, pane_grid,
+    radio, row, scrollable, stack, text, text_input, vertical_space,
 };
 use iced::{Element, Length, Task, Theme};
 use mock_data::{FileType, QueueItem, RemoteFile, TransferStatus};
+use scheduler::Scheduler;
 use settings::AppConfig;
 use sftp_client::SftpClient;
+use tray::{TrayAction, TrayManager};
 
+use chrono::Local;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -22,6 +27,7 @@ use tokio::sync::mpsc;
 pub fn main() -> iced::Result {
     iced::application("Simple SFTP", SftpApp::update, SftpApp::view)
         .theme(|_| Theme::Dark)
+        .subscription(SftpApp::subscription)
         .run()
 }
 
@@ -43,14 +49,17 @@ struct SftpApp {
     queue_items: Vec<QueueItem>,
     remote_files: Vec<RemoteFile>,
     current_remote_path: String,
-    // Context Menu
-    context_menu: Option<RemoteFile>,
+    // Context Menu / Hover
+    hovered_file: Option<String>,
     is_scanning_queue: bool,
     // Download Manager
     download_tx: Option<mpsc::Sender<DownloadCommand>>,
     download_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<DownloadEvent>>>>,
     is_downloading: bool,
     selected_queue_item: Option<String>,
+    // Tray Icon
+    tray_manager: Option<TrayManager>,
+    last_schedule_allowed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -83,12 +92,14 @@ impl Default for SftpApp {
             queue_items: Vec::new(),
             remote_files: Vec::new(),
             current_remote_path: ".".into(), // Start at home/current directory
-            context_menu: None,
+            hovered_file: None,
             is_scanning_queue: false,
             download_tx: None,
             download_rx: None,
             is_downloading: false,
             selected_queue_item: None,
+            tray_manager: None,
+            last_schedule_allowed: true,
         }
     }
 }
@@ -97,6 +108,7 @@ impl Default for SftpApp {
 enum AppState {
     MainView,
     SettingsView,
+    ScheduleView,
 }
 
 #[derive(Debug, Clone)]
@@ -118,10 +130,16 @@ enum Message {
     // Local Navigation
     SelectDownloadPath,
     DownloadPathSelected(Option<std::path::PathBuf>),
-    // Context Menu
-    RemoteFileRightClicked(RemoteFile),
-    ContextOptionSelected(ContextOption),
-    ScanResult(Result<Vec<RemoteFile>, String>),
+    RemoteFileDoubleClicked(String),
+    // Hover & Actions
+    HoverFile(String),
+    UnhoverFile,
+    QueueFile(RemoteFile),
+    DownloadFile(RemoteFile),
+    // Scan result (auto_start)
+    ScanResult(Result<Vec<RemoteFile>, String>, bool),
+    // Remote
+    RefreshRemote,
     // Pane
     PaneResized(pane_grid::ResizeEvent),
     // Downloads
@@ -141,6 +159,18 @@ enum Message {
     },
     DownloadStarted(String),
     QueueItemClicked(String),
+    // Tray
+    TrayEvent,
+    HideToTray,
+    ShowWindow,
+    // Schedule
+    ScheduleModeChanged(settings::ScheduleMode),
+    ScheduleStartTimeChanged(u8, u8),
+    Tick(Instant), // Periodic check
+    ScheduleEndTimeChanged(u8, u8),
+    ScheduleDayToggled(u8), // 0=Mon, 6=Sun
+    SaveSchedule,
+    CancelSchedule,
     // Toolbar
     NoOp,
 }
@@ -149,15 +179,10 @@ enum Message {
 enum ConfigOption {
     Settings,
     Connect,
+    Schedule,
     Minimize,
     Disconnect,
     Exit,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ContextOption {
-    Download,
-    Dismiss,
 }
 
 impl SftpApp {
@@ -189,13 +214,18 @@ impl SftpApp {
                             });
                         }
                     }
+                    ConfigOption::Schedule => {
+                        self.state = AppState::ScheduleView;
+                    }
+                    ConfigOption::Minimize => {
+                        return self.update(Message::HideToTray);
+                    }
                     ConfigOption::Disconnect => {
                         self.is_connected = false;
                         self.sftp_client = None;
                         self.remote_files.clear();
                     }
                     ConfigOption::Exit => return iced::exit(),
-                    _ => {}
                 }
             }
             Message::PaneResized(event) => {
@@ -298,50 +328,104 @@ impl SftpApp {
                     }
                 }
             }
-            Message::RemoteFileRightClicked(file) => {
-                // Removed point
-                self.context_menu = Some(file);
+            Message::HoverFile(filename) => {
+                self.hovered_file = Some(filename);
             }
-            Message::ContextOptionSelected(option) => {
-                if let Some(file) = self.context_menu.take() {
-                    // Removed point from destructuring
-                    match option {
-                        ContextOption::Download => {
-                            if let Some(client) = &self.sftp_client {
-                                let client = client.clone();
-                                self.is_scanning_queue = true;
+            Message::UnhoverFile => {
+                self.hovered_file = None;
+            }
+            Message::QueueFile(file) => {
+                // Check if it's a file or folder
+                if file.file_type == FileType::File {
+                    self.is_scanning_queue = true;
+                    let file_clone = file.clone();
+                    return Task::future(async move {
+                        Message::ScanResult(Ok(vec![file_clone]), false)
+                    });
+                }
 
-                                return Task::future(async move {
-                                    let path = std::path::Path::new(&file.path).to_path_buf();
+                // Queue only (don't auto-start)
+                self.is_scanning_queue = true;
 
-                                    let res = tokio::task::spawn_blocking(move || {
-                                        let c = client.lock().unwrap();
-                                        if file.file_type == FileType::Folder {
-                                            c.recursive_scan(&path)
-                                        } else {
-                                            Ok(vec![file])
-                                        }
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| Err(e.to_string()));
+                let client = self.sftp_client.clone();
+                let path = file.path.clone();
+                let file_clone = file.clone(); // Clone file for the `Ok(vec![file_clone])` case
 
-                                    Message::ScanResult(res)
-                                });
-                            }
+                return Task::future(async move {
+                    let res = tokio::task::spawn_blocking(move || {
+                        if let Some(client) = client {
+                            let c = client.lock().unwrap();
+                            c.recursive_scan(std::path::Path::new(&path))
+                        } else {
+                            // If client is not available, we can't scan, but we can still queue the single file
+                            Ok(vec![file_clone])
                         }
-                        ContextOption::Dismiss => {
-                            // Do nothing, just close the menu
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+
+                    Message::ScanResult(res, false) // auto_start = false
+                });
+            }
+            Message::DownloadFile(file) => {
+                // Check if it's a file or folder
+                if file.file_type == FileType::File {
+                    self.is_scanning_queue = true;
+                    let file_clone = file.clone();
+                    return Task::future(
+                        async move { Message::ScanResult(Ok(vec![file_clone]), true) },
+                    );
+                }
+
+                // Recursively scan path
+                self.is_scanning_queue = true;
+
+                let client = self.sftp_client.clone();
+                let path = file.path.clone();
+                let file_clone = file.clone();
+
+                return Task::future(async move {
+                    let res = tokio::task::spawn_blocking(move || {
+                        if let Some(client) = client {
+                            let c = client.lock().unwrap();
+                            c.recursive_scan(std::path::Path::new(&path))
+                        } else {
+                            Ok(vec![file_clone])
                         }
-                    }
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+
+                    Message::ScanResult(res, true) // auto_start = true
+                });
+            }
+            Message::RefreshRemote => {
+                if let Some(client) = &self.sftp_client {
+                    let client = client.clone();
+                    // Reload current path
+                    let path = self.current_remote_path.clone();
+
+                    return Task::future(async move {
+                        let path_clone = path.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            let c = client.lock().unwrap();
+                            c.list_dir(std::path::Path::new(&path_clone))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        Message::RemoteFilesLoaded(path, res)
+                    });
                 }
             }
-            Message::ScanResult(result) => {
+            Message::ScanResult(result, auto_start) => {
                 self.is_scanning_queue = false;
+                println!("DEBUG: ScanResult received. Auto-start: {}", auto_start);
                 match result {
                     Ok(files) => {
+                        println!("DEBUG: Found {} files.", files.len());
                         for file in files {
                             if !self.queue_items.iter().any(|i| i.remote_file == file.path) {
-                                self.queue_items.push(QueueItem {
+                                let item = QueueItem {
                                     local_location: self.config.local_download_path.clone(),
                                     filename: file.name,
                                     remote_file: file.path,
@@ -349,11 +433,41 @@ impl SftpApp {
                                     bytes_downloaded: 0,
                                     priority: 10,
                                     status: TransferStatus::Pending,
-                                });
+                                };
+                                self.queue_items.push(item.clone());
+                                println!("DEBUG: Added item to queue: {}", item.filename);
+
+                                // If downloading is active, send the item to the manager immediately
+                                if self.is_downloading {
+                                    if let Some(tx) = &self.download_tx {
+                                        // Always add to manager if it's running. It will handle queueing/starting.
+                                        match tx.try_send(DownloadCommand::AddItem(item)) {
+                                            Ok(_) => println!("DEBUG: Sent AddItem to manager"),
+                                            Err(e) => {
+                                                println!("DEBUG: Failed to send AddItem: {}", e)
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("DEBUG: Item already in queue: {}", file.name);
                             }
+                        }
+
+                        // auto-start logic
+                        if auto_start
+                            && !self.is_downloading
+                            && self
+                                .queue_items
+                                .iter()
+                                .any(|i| i.status == TransferStatus::Pending)
+                        {
+                            println!("DEBUG: Auto-starting manager...");
+                            return self.start_manager();
                         }
                     }
                     Err(e) => {
+                        println!("DEBUG: Scan failed: {}", e);
                         self.app_error = Some(format!("Scan failed: {}", e));
                     }
                 }
@@ -413,24 +527,7 @@ impl SftpApp {
 
             // Download Controls
             Message::StartDownloads => {
-                if self.download_tx.is_none() {
-                    let (tx, rx) =
-                        download_manager::create_download_manager(self.config.sftp_config.clone());
-                    self.download_tx = Some(tx.clone());
-                    self.download_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
-                    self.is_downloading = true;
-
-                    // Send all pending items to the download manager
-                    for item in &self.queue_items {
-                        if item.status == TransferStatus::Pending {
-                            let _ = tx.try_send(DownloadCommand::AddItem(item.clone()));
-                        }
-                    }
-                    let _ = tx.try_send(DownloadCommand::StartAll);
-
-                    // Start polling for events
-                    return self.update(Message::PollDownloadEvents);
-                }
+                return self.start_manager();
             }
             Message::PollDownloadEvents => {
                 if let Some(rx) = &self.download_rx {
@@ -536,67 +633,142 @@ impl SftpApp {
             Message::QueueItemClicked(path) => {
                 self.selected_queue_item = Some(path);
             }
+
+            // Tray Icon Events
+            Message::TrayEvent => {
+                if let Some(tray) = &self.tray_manager {
+                    tray.update(); // Pump GTK events
+                    if let Some(action) = tray.poll_events() {
+                        match action {
+                            TrayAction::Show => {
+                                return self.update(Message::ShowWindow);
+                            }
+                            TrayAction::Exit => {
+                                return iced::exit();
+                            }
+                        }
+                    }
+                }
+            }
+            Message::HideToTray => {
+                // Create tray icon if it doesn't exist
+                if self.tray_manager.is_none() {
+                    match TrayManager::new() {
+                        Ok(tray) => {
+                            tray.update(); // Initial pump
+                            self.tray_manager = Some(tray);
+                        }
+                        Err(e) => {
+                            self.app_error = Some(format!("Failed to create tray icon: {}", e));
+                            return Task::none();
+                        }
+                    }
+                }
+                // Hide window
+                return iced::window::get_latest().and_then(iced::window::close);
+            }
+            Message::ShowWindow => {
+                // Remove tray icon
+                self.tray_manager = None;
+                // Window will be shown automatically when tray is removed
+                // or we can create a new window if needed
+                return Task::none();
+            }
+
+            // Schedule Config
+            Message::ScheduleModeChanged(mode) => {
+                self.config.schedule.mode = mode;
+            }
+            Message::ScheduleStartTimeChanged(hour, minute) => {
+                self.config.schedule.start_time.hour = hour;
+                self.config.schedule.start_time.minute = minute;
+            }
+            Message::ScheduleEndTimeChanged(hour, minute) => {
+                self.config.schedule.end_time.hour = hour;
+                self.config.schedule.end_time.minute = minute;
+            }
+            Message::ScheduleDayToggled(day_idx) => match day_idx {
+                0 => self.config.schedule.days.mon = !self.config.schedule.days.mon,
+                1 => self.config.schedule.days.tue = !self.config.schedule.days.tue,
+                2 => self.config.schedule.days.wed = !self.config.schedule.days.wed,
+                3 => self.config.schedule.days.thu = !self.config.schedule.days.thu,
+                4 => self.config.schedule.days.fri = !self.config.schedule.days.fri,
+                5 => self.config.schedule.days.sat = !self.config.schedule.days.sat,
+                6 => self.config.schedule.days.sun = !self.config.schedule.days.sun,
+                _ => {}
+            },
+            Message::Tick(_) => {
+                let now = Local::now();
+                let allowed = Scheduler::is_allowed(&self.config.schedule, now);
+
+                if allowed != self.last_schedule_allowed {
+                    self.last_schedule_allowed = allowed;
+                    if let Some(tx) = &self.download_tx {
+                        if self.is_downloading {
+                            if allowed {
+                                let _ = tx.try_send(DownloadCommand::ResumeAll);
+                            } else {
+                                let _ = tx.try_send(DownloadCommand::PauseAll);
+                            }
+                        }
+                    }
+                }
+
+                // Auto-start check
+                if allowed && !self.is_downloading {
+                    // Check if we have pending items
+                    if self
+                        .queue_items
+                        .iter()
+                        .any(|i| i.status == TransferStatus::Pending)
+                    {
+                        return self.start_manager();
+                    }
+                }
+            }
+            Message::SaveSchedule => {
+                let _ = self.config.save();
+                self.state = AppState::MainView;
+            }
+            Message::CancelSchedule => {
+                // reload from disk to revert changes or just switch view?
+                // For now just switch, but changes in memory obey immediate mode.
+                // Ideally we should have a temp config or reload.
+                self.config = AppConfig::load(); // Revert
+                self.state = AppState::MainView;
+            }
+
             _ => {}
         }
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
+        match self.state {
+            AppState::SettingsView => return self.view_settings(),
+            AppState::ScheduleView => return self.view_schedule(),
+            _ => {}
+        }
+
         let main_view = self.view_main();
 
-        let root = if self.state == AppState::SettingsView {
-            stack![main_view, self.view_settings()].into()
-        } else {
-            main_view
+        // This logic was for overlay, but SettingsView is now full screen or we can keep it overlay.
+        // The original code used a stack/overlay approach for Settings.
+        // Let's migrate to a clearer state matching, consistent with my proposed changes.
+        // Actually, looking at lines 647-651, settings was overlay.
+        // User requested "dialog".
+        // Let's stick to full view switching for Schedule as per my plan implementation,
+        // unless I want to overlay it. Let's overlay it like settings if settings was overlay.
+        // Line 647 says: if self.state == AppState::SettingsView { stack![main_view, self.view_settings()] }
+        // So I should follow that pattern.
+
+        let root = match self.state {
+            AppState::SettingsView => stack![main_view, self.view_settings()].into(),
+            AppState::ScheduleView => stack![main_view, self.view_schedule()].into(),
+            _ => main_view,
         };
 
-        if let Some(file) = &self.context_menu {
-            // Updated to directly use file
-            let menu = container(
-                column![
-                    text(format!("Selected: {}", file.name)).size(14),
-                    self.context_menu_view()
-                ]
-                .spacing(10)
-                .padding(10),
-            )
-            .style(style::pane_style) // Use a styled container for the menu box
-            .width(Length::Shrink)
-            .height(Length::Shrink)
-            .padding(20);
-
-            // Backdrop to close menu
-            let backdrop = button(text(" "))
-                .on_press(Message::ContextOptionSelected(ContextOption::Dismiss)) // Changed to Dismiss
-                .style(button::text) // Transparent-ish
-                .width(Length::Fill)
-                .height(Length::Fill);
-
-            stack![
-                root,
-                backdrop,
-                container(menu)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::Alignment::Center)
-                    .align_y(iced::Alignment::Center)
-            ]
-            .into()
-        } else {
-            root
-        }
-    }
-
-    fn context_menu_view(&self) -> Element<'_, Message> {
-        container(
-            button(text("Download").size(14))
-                .on_press(Message::ContextOptionSelected(ContextOption::Download))
-                .padding(5)
-                .style(button::secondary),
-        )
-        .padding(5)
-        .style(style::header_style)
-        .into()
+        root
     }
 
     fn view_main(&self) -> Element<'_, Message> {
@@ -664,9 +836,20 @@ impl SftpApp {
         } else {
             ""
         };
+
+        let schedule_text = if self.config.schedule.mode != settings::ScheduleMode::None {
+            if self.last_schedule_allowed {
+                " | Schedule: Running"
+            } else {
+                " | Schedule: Paused ⏸"
+            }
+        } else {
+            ""
+        };
+
         let status_text = format!(
-            "Total Queued: {} ({}){}",
-            total_queued, total_size_str, scanning_text
+            "Total Queued: {} ({}){}{}",
+            total_queued, total_size_str, scanning_text, schedule_text
         );
 
         let status_bar = container(text(status_text).size(12))
@@ -682,6 +865,8 @@ impl SftpApp {
             status_bar
         ];
 
+        let mut base_content: Element<Message> = base_content.into();
+
         if self.is_config_menu_open {
             let menu_options = column![
                 button("Settings")
@@ -689,6 +874,9 @@ impl SftpApp {
                     .width(Length::Fill),
                 button("Connect")
                     .on_press(Message::ConfigOptionSelected(ConfigOption::Connect))
+                    .width(Length::Fill),
+                button("Schedule")
+                    .on_press(Message::ConfigOptionSelected(ConfigOption::Schedule))
                     .width(Length::Fill),
                 button("Minimize")
                     .on_press(Message::ConfigOptionSelected(ConfigOption::Minimize))
@@ -712,10 +900,11 @@ impl SftpApp {
                     right: 0.0,
                 });
 
-            stack![base_content, menu_overlay].into()
-        } else {
-            base_content.into()
+            // stack![base_content, menu_overlay].into()
+            base_content = stack![base_content, menu_overlay].into();
         }
+
+        base_content
     }
 
     fn view_queue(&self) -> Element<'_, Message> {
@@ -893,6 +1082,7 @@ impl SftpApp {
                     let type_str = if is_folder { "Folder" } else { "File" };
 
                     let is_selected = self.selected_file.as_ref() == Some(&file.name);
+                    let is_hovered = self.hovered_file.as_ref() == Some(&file.name);
 
                     let row_content = row![
                         container(name_widget).width(Length::FillPortion(2)),
@@ -902,7 +1092,7 @@ impl SftpApp {
                     ]
                     .spacing(5);
 
-                    let btn = button(container(row_content).padding(5))
+                    let main_btn = button(container(row_content).padding(5))
                         .on_press(Message::RemoteFileClicked(file.clone()))
                         .width(Length::Fill)
                         .style(move |_thread, _status| {
@@ -920,8 +1110,28 @@ impl SftpApp {
                             }
                         });
 
-                    mouse_area(btn)
-                        .on_right_press(Message::RemoteFileRightClicked(file.clone())) // Removed closure and point
+                    let actions = if is_hovered {
+                        row![
+                            button(text("Queue").size(12))
+                                .on_press(Message::QueueFile(file.clone()))
+                                .style(button::secondary)
+                                .padding(5),
+                            button(text("Download").size(12))
+                                .on_press(Message::DownloadFile(file.clone()))
+                                .style(button::primary)
+                                .padding(5),
+                        ]
+                        .spacing(5)
+                        .padding(2)
+                    } else {
+                        row![].padding(2)
+                    };
+
+                    let container_row = row![main_btn, actions].align_y(iced::Alignment::Center);
+
+                    mouse_area(container_row)
+                        .on_enter(Message::HoverFile(file.name.clone()))
+                        .on_exit(Message::UnhoverFile)
                         .into()
                 })
                 .collect::<Vec<_>>(),
@@ -1016,6 +1226,170 @@ impl SftpApp {
         .into()
     }
 
+    fn view_schedule(&self) -> Element<'_, Message> {
+        let title = text("Download Schedule").size(24);
+
+        let mode_section = column![
+            text("Schedule Mode:").size(16),
+            radio(
+                "None",
+                settings::ScheduleMode::None,
+                Some(self.config.schedule.mode),
+                Message::ScheduleModeChanged
+            ),
+            radio(
+                "Daily",
+                settings::ScheduleMode::Daily,
+                Some(self.config.schedule.mode),
+                Message::ScheduleModeChanged
+            ),
+            radio(
+                "Weekly",
+                settings::ScheduleMode::Weekly,
+                Some(self.config.schedule.mode),
+                Message::ScheduleModeChanged
+            ),
+        ]
+        .spacing(10);
+
+        let mut content = column![title, mode_section].spacing(20).padding(20);
+
+        if self.config.schedule.mode != settings::ScheduleMode::None {
+            // Time Pickers
+            let format_time = |h: u8, m: u8| -> String {
+                let period = if h >= 12 { "PM" } else { "AM" };
+                let h12 = if h == 0 || h == 12 { 12 } else { h % 12 };
+                format!("{:02}:{:02} {}", h12, m, period)
+            };
+
+            let start_time_row = row![
+                text("Start Time:").width(100),
+                text(format_time(
+                    self.config.schedule.start_time.hour,
+                    self.config.schedule.start_time.minute
+                ))
+                .size(16),
+                button("+H")
+                    .on_press(Message::ScheduleStartTimeChanged(
+                        (self.config.schedule.start_time.hour + 1) % 24,
+                        self.config.schedule.start_time.minute
+                    ))
+                    .style(button::secondary),
+                button("-H")
+                    .on_press(Message::ScheduleStartTimeChanged(
+                        (self.config.schedule.start_time.hour + 23) % 24,
+                        self.config.schedule.start_time.minute
+                    ))
+                    .style(button::secondary),
+                button("+M")
+                    .on_press(Message::ScheduleStartTimeChanged(
+                        self.config.schedule.start_time.hour,
+                        (self.config.schedule.start_time.minute + 5) % 60
+                    ))
+                    .style(button::secondary),
+                button("-M")
+                    .on_press(Message::ScheduleStartTimeChanged(
+                        self.config.schedule.start_time.hour,
+                        (self.config.schedule.start_time.minute + 55) % 60
+                    ))
+                    .style(button::secondary),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+            let start_val = self.config.schedule.start_time.hour as u16 * 60
+                + self.config.schedule.start_time.minute as u16;
+            let end_val = self.config.schedule.end_time.hour as u16 * 60
+                + self.config.schedule.end_time.minute as u16;
+            let is_next_day = end_val < start_val;
+
+            let end_time_row = row![
+                text("End Time:").width(100),
+                text(format_time(
+                    self.config.schedule.end_time.hour,
+                    self.config.schedule.end_time.minute
+                ))
+                .size(16),
+                button("+H")
+                    .on_press(Message::ScheduleEndTimeChanged(
+                        (self.config.schedule.end_time.hour + 1) % 24,
+                        self.config.schedule.end_time.minute
+                    ))
+                    .style(button::secondary),
+                button("-H")
+                    .on_press(Message::ScheduleEndTimeChanged(
+                        (self.config.schedule.end_time.hour + 23) % 24,
+                        self.config.schedule.end_time.minute
+                    ))
+                    .style(button::secondary),
+                button("+M")
+                    .on_press(Message::ScheduleEndTimeChanged(
+                        self.config.schedule.end_time.hour,
+                        (self.config.schedule.end_time.minute + 5) % 60
+                    ))
+                    .style(button::secondary),
+                button("-M")
+                    .on_press(Message::ScheduleEndTimeChanged(
+                        self.config.schedule.end_time.hour,
+                        (self.config.schedule.end_time.minute + 55) % 60
+                    ))
+                    .style(button::secondary),
+                if is_next_day {
+                    text("(Next Day)")
+                        .size(12)
+                        .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                } else {
+                    text("")
+                },
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+            content = content.push(column![start_time_row, end_time_row].spacing(10));
+        }
+
+        if self.config.schedule.mode == settings::ScheduleMode::Weekly {
+            let days = &self.config.schedule.days;
+            let days_row = row![
+                checkbox("Mon", days.mon).on_toggle(|_| Message::ScheduleDayToggled(0)),
+                checkbox("Tue", days.tue).on_toggle(|_| Message::ScheduleDayToggled(1)),
+                checkbox("Wed", days.wed).on_toggle(|_| Message::ScheduleDayToggled(2)),
+                checkbox("Thu", days.thu).on_toggle(|_| Message::ScheduleDayToggled(3)),
+                checkbox("Fri", days.fri).on_toggle(|_| Message::ScheduleDayToggled(4)),
+                checkbox("Sat", days.sat).on_toggle(|_| Message::ScheduleDayToggled(5)),
+                checkbox("Sun", days.sun).on_toggle(|_| Message::ScheduleDayToggled(6)),
+            ]
+            .spacing(15);
+
+            content = content.push(text("Active Days:")).push(days_row);
+        }
+
+        let buttons = row![
+            button("Save").on_press(Message::SaveSchedule),
+            button("Cancel")
+                .on_press(Message::CancelSchedule)
+                .style(button::secondary),
+        ]
+        .spacing(10);
+
+        content = content.push(horizontal_rule(1)).push(buttons);
+
+        container(
+            container(content.spacing(20).max_width(600))
+                .padding(20)
+                .style(style::header_style),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_t: &Theme| container::Style {
+            background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+            ..Default::default()
+        })
+        .into()
+    }
+
     fn format_bytes(&self, size_str: &str) -> String {
         let size = size_str
             .trim()
@@ -1035,5 +1409,48 @@ impl SftpApp {
         } else {
             format!("{} B", size)
         }
+    }
+
+    fn start_manager(&mut self) -> Task<Message> {
+        if self.download_tx.is_none() {
+            let (tx, rx) =
+                download_manager::create_download_manager(self.config.sftp_config.clone());
+            self.download_tx = Some(tx.clone());
+            self.download_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+            self.is_downloading = true;
+
+            // Send all pending items to the download manager
+            for item in &self.queue_items {
+                if item.status == TransferStatus::Pending {
+                    let _ = tx.try_send(DownloadCommand::AddItem(item.clone()));
+                }
+            }
+            // Removed: If schedule is NOT allowed, we used to pause info.
+            // But now we allow manual override, so if start_manager is called (manually or auto),
+            // we assume we WANT to download.
+            // Tick will handle pausing if schedule changes state.
+
+            let _ = tx.try_send(DownloadCommand::StartAll);
+
+            // Start polling for events
+            return self.update(Message::PollDownloadEvents);
+        }
+        Task::none()
+    }
+
+    fn subscription(&self) -> iced::Subscription<Message> {
+        let tray_sub = if self.tray_manager.is_some() {
+            iced::time::every(std::time::Duration::from_millis(50)).map(|_| {
+                // Pump GTK events to keep tray icon alive
+                Message::TrayEvent
+            })
+        } else {
+            iced::Subscription::none()
+        };
+
+        // Tick every 60 seconds for scheduler
+        let tick_sub = iced::time::every(std::time::Duration::from_secs(60)).map(Message::Tick);
+
+        iced::Subscription::batch(vec![tray_sub, tick_sub])
     }
 }

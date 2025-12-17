@@ -7,5 +7,25 @@
     "private_key_path": null
   },
   "download_threshold": 0,
-  "local_download_path": "/home/rhonaldjr/Documents"
+  "local_download_path": "/home/rhonaldjr/Downloads",
+  "schedule": {
+    "mode": "Daily",
+    "start_time": {
+      "hour": 15,
+      "minute": 20
+    },
+    "end_time": {
+      "hour": 15,
+      "minute": 30
+    },
+    "days": {
+      "mon": false,
+      "tue": false,
+      "wed": false,
+      "thu": false,
+      "fri": false,
+      "sat": false,
+      "sun": false
+    }
+  }
 }

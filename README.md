@@ -13,8 +13,9 @@
 | **Download Queue** | ✅ Implemented | Queue items added via context menu. Recursive scanning supported. |
 | **Context Menu** | ✅ Implemented | Right-click overlay with "Download" option and recursive folder scanning. |
 | **Target Selection** | ✅ Implemented | Choose local download destination via native dialog. |
-| **File Transfers** | 📅 Planned | Actual file transfer logic (downloading queue items) to be implemented. |
-| **Pause and Resume Downloads** | 📅 Planned | The ability to pause and resume downloads. |
+| **System Tray** | ✅ Implemented | Minimize to system tray running in background. |
+| **File Transfers** | ✅ Implemented | Asynchronous concurrent downloads with progress tracking. |
+| **Pause and Resume** | ✅ Implemented | Pause and resume individual downloads. |
 | **Throttle Downloads** | 📅 Planned | The ability to limit the download speed |
 | **Scheduling** | 📅 Planned | The ability to schedule downloads |
 | **Detect Media Type** | 📅 Planned | Detect the media type and then pick up the appropriate download folders |
@@ -29,9 +30,17 @@
     *   Recursive directory scanning.
     *   Target folder selection.
     *   Queue management (Deduplication, Statistics).
-*   **Phase 3**: **File Transfer Logic**: Implementing the asynchronous download engine to process the queue.
+    *   System Tray integration (minimize to background).
+*   **Phase 3 (Completed)**: **File Transfer Engine**:
+    *   Asynchronous chunked downloading.
+    *   Concurrent transfer limits.
+    *   Pause/Resume/Cancel support.
 *   **Phase 4**: **Local File Browser** integration for drag-and-drop support.
-*   **Phase 5**: Advanced transfer features (Pause, Resume, Scheduling).
+*   **Phase 5**: **Advanced Features**:
+    *   Scheduling downloads.
+    *   Bandwidth throttling.
+    *   Media type detection and auto-organization.
+    *   File cleanup tools.
 
 ## How to Run
 

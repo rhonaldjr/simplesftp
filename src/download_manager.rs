@@ -13,10 +13,15 @@ const MAX_CONCURRENT: usize = 2;
 #[derive(Debug, Clone)]
 pub enum DownloadCommand {
     StartAll,
+    PauseAll,
+    ResumeAll,
     Pause(String), // remote_file path
     Resume(String),
     Cancel(String),
     AddItem(QueueItem),
+    // Internal commands sent by download tasks
+    TaskPaused { remote_file: String, offset: u64 },
+    TaskDone { remote_file: String },
 }
 
 #[derive(Debug, Clone)]
@@ -42,28 +47,33 @@ pub enum DownloadEvent {
 
 pub struct DownloadManager {
     config: SftpConfig,
+    command_tx: mpsc::Sender<DownloadCommand>, // Need this to pass to tasks
     command_rx: mpsc::Receiver<DownloadCommand>,
     event_tx: mpsc::Sender<DownloadEvent>,
     queue: Vec<QueueItem>,
     active_downloads: HashSet<String>,
     paused_downloads: Arc<Mutex<HashMap<String, u64>>>, // Shared for pause checking
     cancelled: Arc<Mutex<HashSet<String>>>,             // Shared for cancel checking
+    is_global_paused: bool,
 }
 
 impl DownloadManager {
     pub fn new(
         config: SftpConfig,
+        command_tx: mpsc::Sender<DownloadCommand>,
         command_rx: mpsc::Receiver<DownloadCommand>,
         event_tx: mpsc::Sender<DownloadEvent>,
     ) -> Self {
         Self {
             config,
+            command_tx,
             command_rx,
             event_tx,
             queue: Vec::new(),
             active_downloads: HashSet::new(),
             paused_downloads: Arc::new(Mutex::new(HashMap::new())),
             cancelled: Arc::new(Mutex::new(HashSet::new())),
+            is_global_paused: false,
         }
     }
 
@@ -78,6 +88,20 @@ impl DownloadManager {
                     DownloadCommand::StartAll => {
                         // Will be processed below
                     }
+                    DownloadCommand::PauseAll => {
+                        self.is_global_paused = true;
+                        // Pause all active downloads
+                        let mut paused = self.paused_downloads.lock().await;
+
+                        for path in &self.active_downloads {
+                            paused.insert(path.clone(), 0);
+                        }
+                    }
+                    DownloadCommand::ResumeAll => {
+                        self.is_global_paused = false;
+                        let mut paused = self.paused_downloads.lock().await;
+                        paused.clear();
+                    }
                     DownloadCommand::Pause(path) => {
                         let mut paused = self.paused_downloads.lock().await;
                         paused.insert(path.clone(), 0);
@@ -88,13 +112,30 @@ impl DownloadManager {
                     }
                     DownloadCommand::Cancel(path) => {
                         let mut cancelled = self.cancelled.lock().await;
-                        cancelled.insert(path);
+                        cancelled.insert(path.clone());
+                        // Also remove from queue immediately so it doesn't get picked up again
+                        self.queue.retain(|i| i.remote_file != path);
+                    }
+                    DownloadCommand::TaskPaused {
+                        remote_file,
+                        offset,
+                    } => {
+                        self.active_downloads.remove(&remote_file);
+                        // Update queue item with progress so we can resume correctly
+                        if let Some(item) =
+                            self.queue.iter_mut().find(|i| i.remote_file == remote_file)
+                        {
+                            item.bytes_downloaded = offset;
+                        }
+                    }
+                    DownloadCommand::TaskDone { remote_file } => {
+                        self.active_downloads.remove(&remote_file);
                     }
                 }
             }
 
-            // Start downloads if we have capacity
-            while self.active_downloads.len() < MAX_CONCURRENT {
+            // Start downloads if we have capacity AND NOT PAUSED GLOBALLY
+            while self.active_downloads.len() < MAX_CONCURRENT && !self.is_global_paused {
                 // Find next pending item that's not paused or cancelled
                 let paused = self.paused_downloads.lock().await;
                 let cancelled = self.cancelled.lock().await;
@@ -111,9 +152,16 @@ impl DownloadManager {
                     let local_path = format!("{}/{}", item.local_location, item.filename);
                     let config = self.config.clone();
                     let event_tx = self.event_tx.clone();
-                    let offset = paused.get(&remote_file).copied().unwrap_or(0);
+
+                    // Determine start offset: use stored item progress if available
+                    let offset = match paused.get(&remote_file) {
+                        Some(o) => *o,
+                        None => item.bytes_downloaded,
+                    };
+
                     let paused_downloads = self.paused_downloads.clone();
                     let cancelled_downloads = self.cancelled.clone();
+                    let cmd_tx = self.command_tx.clone();
 
                     drop(paused);
                     drop(cancelled);
@@ -136,6 +184,7 @@ impl DownloadManager {
                             local_path,
                             offset,
                             event_tx,
+                            cmd_tx,
                             paused_downloads,
                             cancelled_downloads,
                         )
@@ -153,12 +202,14 @@ impl DownloadManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn download_file(
         config: SftpConfig,
         remote_file: String,
         local_path: String,
         start_offset: u64,
         event_tx: mpsc::Sender<DownloadEvent>,
+        cmd_tx: mpsc::Sender<DownloadCommand>,
         paused_downloads: Arc<Mutex<HashMap<String, u64>>>,
         cancelled_downloads: Arc<Mutex<HashSet<String>>>,
     ) {
@@ -173,19 +224,21 @@ impl DownloadManager {
             Ok(Err(e)) => {
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
-                        remote_file,
+                        remote_file: remote_file.clone(),
                         error: e,
                     })
                     .await;
+                let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                 return;
             }
             Err(e) => {
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
-                        remote_file,
+                        remote_file: remote_file.clone(),
                         error: e.to_string(),
                     })
                     .await;
+                let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                 return;
             }
         };
@@ -207,6 +260,13 @@ impl DownloadManager {
                             remote_file: remote_file.clone(),
                         })
                         .await;
+                    // Notify manager to clear active state and persist offset
+                    let _ = cmd_tx
+                        .send(DownloadCommand::TaskPaused {
+                            remote_file,
+                            offset: bytes_downloaded,
+                        })
+                        .await;
                     return;
                 }
             }
@@ -215,6 +275,7 @@ impl DownloadManager {
             {
                 let cancelled = cancelled_downloads.lock().await;
                 if cancelled.contains(&remote_file) {
+                    let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                     return;
                 }
             }
@@ -244,6 +305,7 @@ impl DownloadManager {
                                 remote_file: remote_file.clone(),
                             })
                             .await;
+                        let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                         break;
                     }
 
@@ -259,19 +321,21 @@ impl DownloadManager {
                 Ok(Err(e)) => {
                     let _ = event_tx
                         .send(DownloadEvent::Failed {
-                            remote_file,
+                            remote_file: remote_file.clone(),
                             error: e,
                         })
                         .await;
+                    let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                     break;
                 }
                 Err(e) => {
                     let _ = event_tx
                         .send(DownloadEvent::Failed {
-                            remote_file,
+                            remote_file: remote_file.clone(),
                             error: e.to_string(),
                         })
                         .await;
+                    let _ = cmd_tx.send(DownloadCommand::TaskDone { remote_file }).await;
                     break;
                 }
             }
@@ -286,7 +350,7 @@ pub fn create_download_manager(
     let (cmd_tx, cmd_rx) = mpsc::channel(100);
     let (event_tx, event_rx) = mpsc::channel(100);
 
-    let manager = DownloadManager::new(config, cmd_rx, event_tx);
+    let manager = DownloadManager::new(config, cmd_tx.clone(), cmd_rx, event_tx);
 
     tokio::spawn(async move {
         manager.run().await;
