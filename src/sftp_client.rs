@@ -88,10 +88,11 @@ impl SftpClient {
                         continue;
                     }
 
+                    let raw_size = stat.size.unwrap_or(0);
                     let size = if stat.is_dir() {
                         "".to_string()
                     } else {
-                        format_size(stat.size.unwrap_or(0))
+                        format_size(raw_size)
                     };
                     let file_type = if stat.is_dir() {
                         FileType::Folder
@@ -116,6 +117,7 @@ impl SftpClient {
                         name: filename,
                         path: full_path_str,
                         size,
+                        size_bytes: raw_size,
                         file_type,
                         modified,
                     });
@@ -160,10 +162,11 @@ impl SftpClient {
                         continue;
                     }
 
+                    let raw_size = stat.size.unwrap_or(0);
                     let size = if stat.is_dir() {
                         "".to_string()
                     } else {
-                        format_size(stat.size.unwrap_or(0))
+                        format_size(raw_size)
                     };
                     let file_type = if stat.is_dir() {
                         FileType::Folder
@@ -185,6 +188,7 @@ impl SftpClient {
                         name: filename,
                         path: path.to_string_lossy().to_string(),
                         size,
+                        size_bytes: raw_size,
                         file_type: file_type.clone(),
                         modified,
                     };
@@ -198,5 +202,57 @@ impl SftpClient {
             }
         }
         Ok(all_files)
+    }
+
+    /// Download a chunk of a remote file starting at the given offset.
+    /// Returns the number of bytes read (0 means EOF).
+    pub fn download_chunk(
+        &self,
+        remote_path: &Path,
+        local_path: &Path,
+        offset: u64,
+        chunk_size: usize,
+    ) -> Result<usize, String> {
+        use std::fs::{File, OpenOptions};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        // Open remote file
+        let mut remote_file = self
+            .sftp
+            .open(remote_path)
+            .map_err(|e| format!("Failed to open remote file: {}", e))?;
+
+        // Seek to offset
+        remote_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed to seek in remote file: {}", e))?;
+
+        // Read chunk
+        let mut buffer = vec![0u8; chunk_size];
+        let bytes_read = remote_file
+            .read(&mut buffer)
+            .map_err(|e| format!("Failed to read from remote file: {}", e))?;
+
+        if bytes_read == 0 {
+            return Ok(0); // EOF
+        }
+
+        // Open/create local file
+        let mut local_file = if offset == 0 {
+            File::create(local_path).map_err(|e| format!("Failed to create local file: {}", e))?
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(local_path)
+                .map_err(|e| format!("Failed to open local file for append: {}", e))?
+        };
+
+        // Write chunk
+        local_file
+            .write_all(&buffer[..bytes_read])
+            .map_err(|e| format!("Failed to write to local file: {}", e))?;
+
+        Ok(bytes_read)
     }
 }

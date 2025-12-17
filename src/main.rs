@@ -1,20 +1,23 @@
 mod components;
+mod download_manager;
 mod mock_data;
 mod settings;
 mod sftp_client;
 mod style;
 
+use download_manager::{DownloadCommand, DownloadEvent};
 use iced::widget::{
     button, column, container, horizontal_space, mouse_area, pane_grid, row, scrollable, stack,
     text, text_input, vertical_space,
 };
 use iced::{Element, Length, Task, Theme};
-use mock_data::{FileType, QueueItem, RemoteFile};
+use mock_data::{FileType, QueueItem, RemoteFile, TransferStatus};
 use settings::AppConfig;
 use sftp_client::SftpClient;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 pub fn main() -> iced::Result {
     iced::application("Simple SFTP", SftpApp::update, SftpApp::view)
@@ -43,6 +46,11 @@ struct SftpApp {
     // Context Menu
     context_menu: Option<RemoteFile>,
     is_scanning_queue: bool,
+    // Download Manager
+    download_tx: Option<mpsc::Sender<DownloadCommand>>,
+    download_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<DownloadEvent>>>>,
+    is_downloading: bool,
+    selected_queue_item: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +85,10 @@ impl Default for SftpApp {
             current_remote_path: ".".into(), // Start at home/current directory
             context_menu: None,
             is_scanning_queue: false,
+            download_tx: None,
+            download_rx: None,
+            is_downloading: false,
+            selected_queue_item: None,
         }
     }
 }
@@ -112,6 +124,23 @@ enum Message {
     ScanResult(Result<Vec<RemoteFile>, String>),
     // Pane
     PaneResized(pane_grid::ResizeEvent),
+    // Downloads
+    StartDownloads,
+    PollDownloadEvents,
+    PauseDownload(String),
+    ResumeDownload(String),
+    CancelDownload(String),
+    DownloadProgress {
+        remote_file: String,
+        bytes_downloaded: u64,
+    },
+    DownloadCompleted(String),
+    DownloadFailed {
+        remote_file: String,
+        error: String,
+    },
+    DownloadStarted(String),
+    QueueItemClicked(String),
     // Toolbar
     NoOp,
 }
@@ -316,10 +345,10 @@ impl SftpApp {
                                     local_location: self.config.local_download_path.clone(),
                                     filename: file.name,
                                     remote_file: file.path,
-                                    downloaded: "0B".into(),
-                                    remaining: file.size,
+                                    size_bytes: file.size_bytes,
+                                    bytes_downloaded: 0,
                                     priority: 10,
-                                    progress: "Pending".into(),
+                                    status: TransferStatus::Pending,
                                 });
                             }
                         }
@@ -381,6 +410,132 @@ impl SftpApp {
             }
             Message::UsernameChanged(val) => self.config.sftp_config.username = val,
             Message::PasswordChanged(val) => self.config.sftp_config.password = Some(val),
+
+            // Download Controls
+            Message::StartDownloads => {
+                if self.download_tx.is_none() {
+                    let (tx, rx) =
+                        download_manager::create_download_manager(self.config.sftp_config.clone());
+                    self.download_tx = Some(tx.clone());
+                    self.download_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+                    self.is_downloading = true;
+
+                    // Send all pending items to the download manager
+                    for item in &self.queue_items {
+                        if item.status == TransferStatus::Pending {
+                            let _ = tx.try_send(DownloadCommand::AddItem(item.clone()));
+                        }
+                    }
+                    let _ = tx.try_send(DownloadCommand::StartAll);
+
+                    // Start polling for events
+                    return self.update(Message::PollDownloadEvents);
+                }
+            }
+            Message::PollDownloadEvents => {
+                if let Some(rx) = &self.download_rx {
+                    let rx = rx.clone();
+                    return Task::future(async move {
+                        let mut guard = rx.lock().await;
+                        match guard.recv().await {
+                            Some(DownloadEvent::Progress {
+                                remote_file,
+                                bytes_downloaded,
+                            }) => Message::DownloadProgress {
+                                remote_file,
+                                bytes_downloaded,
+                            },
+                            Some(DownloadEvent::Completed { remote_file }) => {
+                                Message::DownloadCompleted(remote_file)
+                            }
+                            Some(DownloadEvent::Failed { remote_file, error }) => {
+                                Message::DownloadFailed { remote_file, error }
+                            }
+                            Some(DownloadEvent::Started { remote_file }) => {
+                                Message::DownloadStarted(remote_file)
+                            }
+                            Some(DownloadEvent::Paused { remote_file: _ }) => {
+                                Message::PollDownloadEvents // Continue polling
+                            }
+                            None => Message::NoOp,
+                        }
+                    });
+                }
+            }
+            Message::PauseDownload(path) => {
+                if let Some(tx) = &self.download_tx {
+                    let _ = tx.try_send(DownloadCommand::Pause(path.clone()));
+                }
+                if let Some(item) = self.queue_items.iter_mut().find(|i| i.remote_file == path) {
+                    item.status = TransferStatus::Paused;
+                }
+            }
+            Message::ResumeDownload(path) => {
+                if let Some(tx) = &self.download_tx {
+                    let _ = tx.try_send(DownloadCommand::Resume(path.clone()));
+                }
+                if let Some(item) = self.queue_items.iter_mut().find(|i| i.remote_file == path) {
+                    item.status = TransferStatus::Downloading;
+                }
+            }
+            Message::CancelDownload(path) => {
+                if let Some(tx) = &self.download_tx {
+                    let _ = tx.try_send(DownloadCommand::Cancel(path.clone()));
+                }
+                self.queue_items.retain(|i| i.remote_file != path);
+            }
+            Message::DownloadProgress {
+                remote_file,
+                bytes_downloaded,
+            } => {
+                if let Some(item) = self
+                    .queue_items
+                    .iter_mut()
+                    .find(|i| i.remote_file == remote_file)
+                {
+                    item.bytes_downloaded = bytes_downloaded;
+                    item.status = TransferStatus::Downloading;
+                }
+                // Continue polling for more events
+                return self.update(Message::PollDownloadEvents);
+            }
+            Message::DownloadCompleted(remote_file) => {
+                if let Some(item) = self
+                    .queue_items
+                    .iter_mut()
+                    .find(|i| i.remote_file == remote_file)
+                {
+                    item.status = TransferStatus::Completed;
+                    item.bytes_downloaded = item.size_bytes;
+                }
+                // Continue polling for more events
+                return self.update(Message::PollDownloadEvents);
+            }
+            Message::DownloadFailed { remote_file, error } => {
+                if let Some(item) = self
+                    .queue_items
+                    .iter_mut()
+                    .find(|i| i.remote_file == remote_file)
+                {
+                    item.status = TransferStatus::Failed(error);
+                }
+                // Continue polling for more events
+                return self.update(Message::PollDownloadEvents);
+            }
+            Message::DownloadStarted(remote_file) => {
+                if let Some(item) = self
+                    .queue_items
+                    .iter_mut()
+                    .find(|i| i.remote_file == remote_file)
+                {
+                    item.status = TransferStatus::Downloading;
+                }
+                // Continue polling for more events
+                return self.update(Message::PollDownloadEvents);
+            }
+            Message::QueueItemClicked(path) => {
+                self.selected_queue_item = Some(path);
+            }
             _ => {}
         }
         Task::none()
@@ -500,7 +655,7 @@ impl SftpApp {
         let total_bytes: u64 = self
             .queue_items
             .iter()
-            .map(|i| i.remaining.parse::<u64>().unwrap_or(0))
+            .map(|i| i.size_bytes - i.bytes_downloaded)
             .sum();
         let total_size_str = self.format_bytes(&total_bytes.to_string());
 
@@ -575,13 +730,44 @@ impl SftpApp {
         .padding(5)
         .align_y(iced::Alignment::Center);
 
+        // Determine button actions based on selected queue item
+        let selected = self.selected_queue_item.clone();
+        let selected_status = selected.as_ref().and_then(|path| {
+            self.queue_items
+                .iter()
+                .find(|i| &i.remote_file == path)
+                .map(|i| i.status.clone())
+        });
+
+        let start_btn = if self.is_downloading {
+            button(text("Downloading...").size(12)).style(button::secondary)
+        } else {
+            button(text("Start").size(12))
+                .on_press(Message::StartDownloads)
+                .style(button::primary)
+        };
+
+        let pause_resume_btn = match &selected_status {
+            Some(TransferStatus::Downloading) => button(text("Pause").size(12))
+                .on_press(Message::PauseDownload(selected.clone().unwrap())),
+            Some(TransferStatus::Paused) => button(text("Resume").size(12))
+                .on_press(Message::ResumeDownload(selected.clone().unwrap())),
+            _ => button(text("Pause").size(12)),
+        };
+
+        let remove_btn = if selected.is_some() {
+            button(text("Remove").size(12))
+                .on_press(Message::CancelDownload(selected.clone().unwrap()))
+        } else {
+            button(text("Remove").size(12))
+        };
+
         let toolbar = row![
             text("Queue").size(18),
             horizontal_space(),
-            button(text("Pause").size(12)).on_press(Message::NoOp),
-            button(text("Stop").size(12)).on_press(Message::NoOp),
-            button(text("Remove").size(12)).on_press(Message::NoOp),
-            button(text("Restart").size(12)).on_press(Message::NoOp),
+            start_btn,
+            pause_resume_btn,
+            remove_btn,
         ]
         .spacing(5)
         .padding(5);
@@ -600,15 +786,48 @@ impl SftpApp {
             self.queue_items
                 .iter()
                 .map(|item| {
-                    components::table_row(vec![
-                        item.local_location.clone(),
-                        item.filename.clone(),
-                        item.remote_file.clone(),
-                        item.downloaded.clone(),
-                        self.format_bytes(&item.remaining),
-                        item.priority.to_string(),
-                        item.progress.clone(),
-                    ])
+                    let is_selected = self.selected_queue_item.as_ref() == Some(&item.remote_file);
+                    let remote_file = item.remote_file.clone();
+
+                    let row_content = row![
+                        container(text(&item.filename).size(12)).width(Length::FillPortion(2)),
+                        container(
+                            text(self.format_bytes(&item.bytes_downloaded.to_string())).size(12)
+                        )
+                        .width(Length::FillPortion(1)),
+                        container(
+                            text(self.format_bytes(
+                                &(item.size_bytes - item.bytes_downloaded).to_string()
+                            ))
+                            .size(12)
+                        )
+                        .width(Length::FillPortion(1)),
+                        container(text(item.priority.to_string()).size(12))
+                            .width(Length::FillPortion(1)),
+                        container(text(item.status.to_string()).size(12))
+                            .width(Length::FillPortion(1)),
+                    ]
+                    .spacing(5);
+
+                    let btn = button(container(row_content).padding(3))
+                        .on_press(Message::QueueItemClicked(remote_file))
+                        .width(Length::Fill)
+                        .style(move |_theme, _status| {
+                            if is_selected {
+                                button::Style {
+                                    background: Some(iced::Color::from_rgb(0.2, 0.4, 0.7).into()),
+                                    text_color: iced::Color::WHITE,
+                                    ..Default::default()
+                                }
+                            } else {
+                                button::Style {
+                                    text_color: iced::Color::WHITE,
+                                    ..button::text(_theme, _status)
+                                }
+                            }
+                        });
+
+                    btn.into()
                 })
                 .collect::<Vec<_>>(),
         )
