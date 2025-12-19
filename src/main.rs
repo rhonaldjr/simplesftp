@@ -28,7 +28,26 @@ pub fn main() -> iced::Result {
     iced::application("Simple SFTP", SftpApp::update, SftpApp::view)
         .theme(|_| Theme::Dark)
         .subscription(SftpApp::subscription)
-        .run()
+        .run_with(SftpApp::new)
+}
+
+impl SftpApp {
+    fn new() -> (Self, Task<Message>) {
+        let mut app = Self::default();
+        println!(
+            "DEBUG: SftpApp::new - Auto Connect: {}, Last Path: {}",
+            app.config.auto_connect, app.config.last_remote_path
+        );
+        if app.config.auto_connect && !app.config.sftp_config.host.is_empty() {
+            app.status_message = format!("Auto-connecting to {}...", app.config.sftp_config.host);
+            println!("DEBUG: Triggering Auto-Connect Task");
+            return (
+                app,
+                Task::done(Message::ConfigOptionSelected(ConfigOption::Connect)),
+            );
+        }
+        (app, Task::none())
+    }
 }
 
 struct SftpApp {
@@ -60,12 +79,33 @@ struct SftpApp {
     // Tray Icon
     tray_manager: Option<TrayManager>,
     last_schedule_allowed: bool,
+    status_message: String,
 }
 
 #[derive(Debug, Clone)]
 enum PaneState {
     Queue,
     Remote,
+}
+
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+
+fn save_queue(queue: &[QueueItem]) {
+    if let Ok(file) = File::create("queue.json") {
+        let writer = BufWriter::new(file);
+        let _ = serde_json::to_writer(writer, queue);
+    }
+}
+
+fn load_queue() -> Vec<QueueItem> {
+    if let Ok(file) = File::open("queue.json") {
+        let reader = BufReader::new(file);
+        if let Ok(items) = serde_json::from_reader(reader) {
+            return items;
+        }
+    }
+    Vec::new()
 }
 
 impl Default for SftpApp {
@@ -89,7 +129,7 @@ impl Default for SftpApp {
             sftp_client: None,
             selected_file: None,
             last_click: None,
-            queue_items: Vec::new(),
+            queue_items: load_queue(),
             remote_files: Vec::new(),
             current_remote_path: ".".into(), // Start at home/current directory
             hovered_file: None,
@@ -100,6 +140,7 @@ impl Default for SftpApp {
             selected_queue_item: None,
             tray_manager: None,
             last_schedule_allowed: true,
+            status_message: String::new(),
         }
     }
 }
@@ -138,6 +179,9 @@ enum Message {
     DownloadFile(RemoteFile),
     // Scan result (auto_start)
     ScanResult(Result<Vec<RemoteFile>, String>, bool),
+    // Queue Persistence & Resume
+    ResumeQueue,
+    QueueVerificationResult(Vec<(String, bool, u64)>),
     // Remote
     RefreshRemote,
     // Pane
@@ -173,6 +217,8 @@ enum Message {
     CancelSchedule,
     // Toolbar
     NoOp,
+    // Window Events
+    Event(iced::Event),
 }
 
 #[derive(Debug, Clone)]
@@ -199,8 +245,11 @@ impl SftpApp {
                         self.state = AppState::SettingsView;
                     }
                     ConfigOption::Connect => {
+                        println!("DEBUG: ConfigOption::Connect selected");
                         if !self.config.sftp_config.host.is_empty() {
                             self.is_checking_connection = true;
+                            self.status_message =
+                                format!("Connecting to {}...", self.config.sftp_config.host);
                             let config = self.config.sftp_config.clone();
 
                             return Task::future(async move {
@@ -225,7 +274,13 @@ impl SftpApp {
                         self.sftp_client = None;
                         self.remote_files.clear();
                     }
-                    ConfigOption::Exit => return iced::exit(),
+                    ConfigOption::Exit => {
+                        self.config.last_remote_path = self.current_remote_path.clone();
+                        self.config.auto_connect = self.is_connected;
+                        let _ = self.config.save();
+                        save_queue(&self.queue_items);
+                        return iced::exit();
+                    }
                 }
             }
             Message::PaneResized(event) => {
@@ -253,13 +308,29 @@ impl SftpApp {
                         self.sftp_client = Some(client.clone());
                         self.app_error = None; // clear error
                         self.state = AppState::MainView;
+                        self.status_message = "Connected. Restoring session...".into();
+
+                        println!(
+                            "DEBUG: ConnectionResult - Last Path: '{}'",
+                            self.config.last_remote_path
+                        );
+                        // Restore Last Path
+                        let path = if !self.config.last_remote_path.is_empty() {
+                            self.config.last_remote_path.clone()
+                        } else {
+                            ".".to_string()
+                        };
+                        println!("DEBUG: ConnectionResult - Using Path: '{}'", path);
+                        self.current_remote_path = path.clone();
 
                         // Trigger file listing
-                        let path = self.current_remote_path.clone();
-                        return Task::future(async move {
+                        // client is already Arc<Mutex<SftpClient>>, so clone is cheap
+                        let list_client = client.clone();
+
+                        let listing_task = Task::future(async move {
                             let path_clone = path.clone();
                             let res = tokio::task::spawn_blocking(move || {
-                                let c = client.lock().unwrap();
+                                let c = list_client.lock().unwrap();
                                 c.list_dir(std::path::Path::new(&path_clone))
                             })
                             .await
@@ -267,6 +338,11 @@ impl SftpApp {
 
                             Message::RemoteFilesLoaded(path, res)
                         });
+
+                        // Trigger Queue Resume Check
+                        let resume_task = Task::done(Message::ResumeQueue);
+
+                        return Task::batch(vec![listing_task, resume_task]);
                     }
                     Err(e) => {
                         self.settings_error = Some(e);
@@ -327,6 +403,83 @@ impl SftpApp {
                         });
                     }
                 }
+            }
+            Message::ResumeQueue => {
+                if let Some(client) = self.sftp_client.clone() {
+                    let items_to_check: Vec<(String, String)> = self
+                        .queue_items
+                        .iter()
+                        .filter(|i| {
+                            i.status == TransferStatus::Pending
+                                || i.status == TransferStatus::Downloading
+                                || i.status == TransferStatus::Paused
+                        })
+                        .map(|i| (i.remote_file.clone(), i.filename.clone()))
+                        .collect();
+
+                    if items_to_check.is_empty() {
+                        return Task::none();
+                    }
+
+                    return Task::future(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            let c = client.lock().unwrap();
+                            let mut results = Vec::new();
+                            for (path, _name) in items_to_check {
+                                // Check if file exists and get size
+                                match c.get_file_size(&path) {
+                                    Ok(size) => results.push((path, true, size)),
+                                    Err(_) => results.push((path, false, 0)),
+                                }
+                            }
+                            results
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                        Message::QueueVerificationResult(res)
+                    });
+                }
+            }
+            Message::QueueVerificationResult(results) => {
+                let mut changed = false;
+                for (path, exists, size) in results {
+                    if let Some(item) = self.queue_items.iter_mut().find(|i| i.remote_file == path)
+                    {
+                        if !exists {
+                            item.status = TransferStatus::Failed("Remote file missing".into());
+                            changed = true;
+                        } else {
+                            if item.size_bytes == 0 {
+                                item.size_bytes = size;
+                                changed = true;
+                            }
+                            // Reset 'Downloading' to 'Pending' so manager picks it up (Auto-Resume)
+                            if item.status == TransferStatus::Downloading {
+                                item.status = TransferStatus::Pending;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+
+                if changed {
+                    save_queue(&self.queue_items);
+                }
+
+                let pending_count = self
+                    .queue_items
+                    .iter()
+                    .filter(|i| i.status == TransferStatus::Pending)
+                    .count();
+                if pending_count > 0 {
+                    self.status_message = format!("Resuming {} downloads...", pending_count);
+                } else {
+                    self.status_message = "Connected.".to_string();
+                }
+
+                // Try to start manager if we have pending items
+                return self.start_manager();
             }
             Message::HoverFile(filename) => {
                 self.hovered_file = Some(filename);
@@ -565,6 +718,7 @@ impl SftpApp {
                 }
                 if let Some(item) = self.queue_items.iter_mut().find(|i| i.remote_file == path) {
                     item.status = TransferStatus::Paused;
+                    save_queue(&self.queue_items);
                 }
             }
             Message::ResumeDownload(path) => {
@@ -573,6 +727,7 @@ impl SftpApp {
                 }
                 if let Some(item) = self.queue_items.iter_mut().find(|i| i.remote_file == path) {
                     item.status = TransferStatus::Downloading;
+                    save_queue(&self.queue_items);
                 }
             }
             Message::CancelDownload(path) => {
@@ -580,6 +735,7 @@ impl SftpApp {
                     let _ = tx.try_send(DownloadCommand::Cancel(path.clone()));
                 }
                 self.queue_items.retain(|i| i.remote_file != path);
+                save_queue(&self.queue_items);
             }
             Message::DownloadProgress {
                 remote_file,
@@ -605,6 +761,7 @@ impl SftpApp {
                     item.status = TransferStatus::Completed;
                     item.bytes_downloaded = item.size_bytes;
                 }
+                save_queue(&self.queue_items);
                 // Continue polling for more events
                 return self.update(Message::PollDownloadEvents);
             }
@@ -616,6 +773,7 @@ impl SftpApp {
                 {
                     item.status = TransferStatus::Failed(error);
                 }
+                save_queue(&self.queue_items);
                 // Continue polling for more events
                 return self.update(Message::PollDownloadEvents);
             }
@@ -627,6 +785,7 @@ impl SftpApp {
                 {
                     item.status = TransferStatus::Downloading;
                 }
+                save_queue(&self.queue_items);
                 // Continue polling for more events
                 return self.update(Message::PollDownloadEvents);
             }
@@ -644,6 +803,10 @@ impl SftpApp {
                                 return self.update(Message::ShowWindow);
                             }
                             TrayAction::Exit => {
+                                self.config.last_remote_path = self.current_remote_path.clone();
+                                self.config.auto_connect = self.is_connected;
+                                let _ = self.config.save();
+                                save_queue(&self.queue_items);
                                 return iced::exit();
                             }
                         }
@@ -738,6 +901,22 @@ impl SftpApp {
                 self.state = AppState::MainView;
             }
 
+            Message::Event(event) => {
+                if let iced::Event::Window(iced::window::Event::CloseRequested) = event {
+                    println!("DEBUG: Window Close Requested. Saving config...");
+                    self.config.last_remote_path = self.current_remote_path.clone();
+                    self.config.auto_connect = self.is_connected;
+                    match self.config.save() {
+                        Ok(_) => println!(
+                            "DEBUG: Config saved successfully. Path: {}",
+                            self.config.last_remote_path
+                        ),
+                        Err(e) => println!("DEBUG: Failed to save config: {}", e),
+                    }
+                    save_queue(&self.queue_items);
+                    return iced::exit();
+                }
+            }
             _ => {}
         }
         Task::none()
@@ -848,8 +1027,16 @@ impl SftpApp {
         };
 
         let status_text = format!(
-            "Total Queued: {} ({}){}{}",
-            total_queued, total_size_str, scanning_text, schedule_text
+            "{}Total Queued: {} ({}){}{}",
+            if self.status_message.is_empty() {
+                String::new()
+            } else {
+                format!("{} | ", self.status_message)
+            },
+            total_queued,
+            total_size_str,
+            scanning_text,
+            schedule_text
         );
 
         let status_bar = container(text(status_text).size(12))
@@ -1451,6 +1638,9 @@ impl SftpApp {
         // Tick every 60 seconds for scheduler
         let tick_sub = iced::time::every(std::time::Duration::from_secs(60)).map(Message::Tick);
 
-        iced::Subscription::batch(vec![tray_sub, tick_sub])
+        // Listen for window events (CloseRequested)
+        let event_sub = iced::event::listen().map(Message::Event);
+
+        iced::Subscription::batch(vec![tray_sub, tick_sub, event_sub])
     }
 }

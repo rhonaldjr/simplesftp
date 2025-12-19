@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransferStatus {
     Pending,
     Downloading,
@@ -19,7 +21,7 @@ impl std::fmt::Display for TransferStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub local_location: String,
     pub filename: String,
@@ -30,13 +32,13 @@ pub struct QueueItem {
     pub status: TransferStatus,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FileType {
     File,
     Folder,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteFile {
     pub name: String,
     pub path: String,

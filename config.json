@@ -9,14 +9,14 @@
   "download_threshold": 0,
   "local_download_path": "/home/rhonaldjr/Downloads",
   "schedule": {
-    "mode": "Daily",
+    "mode": "None",
     "start_time": {
-      "hour": 15,
-      "minute": 20
+      "hour": 0,
+      "minute": 0
     },
     "end_time": {
-      "hour": 15,
-      "minute": 30
+      "hour": 6,
+      "minute": 0
     },
     "days": {
       "mon": false,
@@ -27,5 +27,7 @@
       "sat": false,
       "sun": false
     }
-  }
+  },
+  "last_remote_path": ".",
+  "auto_connect": false
 }

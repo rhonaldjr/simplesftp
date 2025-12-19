@@ -6,6 +6,10 @@ pub struct AppConfig {
     pub download_threshold: u8, // 0-100%
     pub local_download_path: String,
     pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub last_remote_path: String,
+    #[serde(default)]
+    pub auto_connect: bool,
 }
 
 impl Default for AppConfig {
@@ -19,6 +23,8 @@ impl Default for AppConfig {
             download_threshold: 0,
             local_download_path,
             schedule: ScheduleConfig::default(),
+            last_remote_path: ".".to_string(),
+            auto_connect: false,
         }
     }
 }

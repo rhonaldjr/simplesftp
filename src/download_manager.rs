@@ -154,10 +154,23 @@ impl DownloadManager {
                     let event_tx = self.event_tx.clone();
 
                     // Determine start offset: use stored item progress if available
-                    let offset = match paused.get(&remote_file) {
+                    let mut offset = match paused.get(&remote_file) {
                         Some(o) => *o,
                         None => item.bytes_downloaded,
                     };
+
+                    // Auto-resume logic: Check if file exists on disk and we are starting from 0 (or unknown)
+                    if offset == 0 {
+                        if let Ok(metadata) = std::fs::metadata(&local_path) {
+                            let file_size = metadata.len();
+                            // If partial download (local < remote), resume
+                            // We need remote size. item.size_bytes has it.
+                            if file_size > 0 && file_size < item.size_bytes {
+                                println!("Resuming '{}' from offset {}", item.filename, file_size);
+                                offset = file_size;
+                            }
+                        }
+                    }
 
                     let paused_downloads = self.paused_downloads.clone();
                     let cancelled_downloads = self.cancelled.clone();

@@ -68,6 +68,20 @@ impl SftpClient {
         })
     }
 
+    pub fn get_file_size(&self, path: &str) -> Result<u64, String> {
+        let canonical_path = self
+            .sftp
+            .realpath(Path::new(path))
+            .map_err(|e| format!("Canonicalization failed: {}", e))?;
+
+        let stat = self
+            .sftp
+            .stat(&canonical_path)
+            .map_err(|e| format!("Stat failed: {}", e))?;
+
+        Ok(stat.size.unwrap_or(0))
+    }
+
     pub fn list_dir(&self, path: &Path) -> Result<(String, Vec<RemoteFile>), String> {
         println!("DEBUG: Listing directory: {:?}", path);
 
