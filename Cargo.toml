@@ -3,6 +3,8 @@ name = "simplesftp"
 version = "0.1.0"
 edition = "2021"
 default-run = "simplesftp"
+description = "A simple SFTP client"
+license = "MIT"
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio", "advanced", "canvas", "image"] }
@@ -18,3 +20,27 @@ tray-icon = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+[package.metadata.deb]
+maintainer = "Your Name <you@example.com>"
+copyright = "2024, Your Name"
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/simplesftp", "usr/bin/", "755"],
+    ["assets/simplesftp.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/pixmaps/simplesftp.png", "644"]
+]
+
+[package.metadata.bundle]
+name = "SimpleSFTP"
+identifier = "com.simplesftp.app"
+version = "0.1.0"
+copyright = "Copyright 2024 Your Name"
+category = "Productivity"
+short_description = "A simple SFTP client"
+long_description = """
+A simple SFTP client built with Rust and Iced.
+"""
+
