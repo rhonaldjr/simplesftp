@@ -22,8 +22,8 @@ tray-icon = "0.18"
 gtk = "0.18"
 
 [package.metadata.deb]
-maintainer = "Your Name <you@example.com>"
-copyright = "2024, Your Name"
+maintainer = "Rhonald John Rose <rhonaldjr@gmail.com>"
+copyright = "2026, Rhonald John Rose"
 depends = "$auto"
 section = "utility"
 priority = "optional"
@@ -37,9 +37,9 @@ assets = [
 name = "SimpleSFTP"
 identifier = "com.simplesftp.app"
 version = "0.1.0"
-copyright = "Copyright 2024 Your Name"
+copyright = "Copyright 2026 Rhonald John Rose"
 category = "Productivity"
-short_description = "A simple SFTP client"
+short_description = "A simple SFTP client written in Rust"
 long_description = """
 A simple SFTP client built with Rust and Iced.
 """

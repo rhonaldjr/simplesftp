@@ -3,12 +3,13 @@ name: Build and Release
 on:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -25,13 +26,47 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+  versioning:
+    name: Calculate Version
+    needs: check
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump Version
+        id: bump
+        run: |
+          # Extract current version from Cargo.toml
+          CURRENT_VERSION=$(grep "^version" Cargo.toml | head -n 1 | cut -d '"' -f 2)
+          echo "Current Version: $CURRENT_VERSION"
+          
+          # split into array
+          IFS='.' read -r -a parts <<< "$CURRENT_VERSION"
+          major="${parts[0]}"
+          minor="${parts[1]}"
+          patch="${parts[2]}"
+          
+          # increment patch
+          new_patch=$((patch + 1))
+          NEW_VERSION="$major.$minor.$new_patch"
+          
+          echo "New Version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
   build-deb-amd64:
     name: Build Debian Package (amd64)
-    needs: check
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: versioning
+    # Run if versioning succeeded (push to main) OR if manually dispatched/other triggers if desired
+    # For now, simplistic dependency: if versioning runs, it provides the version.
+    if: needs.versioning.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Update Cargo.toml Version
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ needs.versioning.outputs.new_version }}"/' Cargo.toml
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -43,24 +78,31 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: simplesftp-amd64.deb
+          name: simplesftp-amd64-deb
           path: target/debian/*.deb
+          if-no-files-found: error
 
   build-deb-arm64:
     name: Build Debian Package (arm64/RPi)
-    needs: check
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: versioning
+    if: needs.versioning.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y curl build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - name: Build & Package on ARM64
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ needs.versioning.outputs.new_version }}"/' Cargo.toml
+      
+      - name: Build inside Arch
         uses: uraimo/run-on-arch-action@v2
         with:
           arch: aarch64
-          distro: bullseye
+          distro: ubuntu22.04
           githubToken: ${{ github.token }}
-          # Basic caching of cargo registry to speed up repeated builds could be added here
-          # but for simplicity we keep it clean.
           install: |
             apt-get update
             apt-get install -y curl build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
@@ -72,16 +114,20 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: simplesftp-arm64.deb
+          name: simplesftp-arm64-deb
           path: target/debian/*.deb
+          if-no-files-found: error
 
   build-macos:
     name: Build macOS DMG
-    needs: check
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: versioning
+    if: needs.versioning.result == 'success'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Update Cargo.toml Version
+        run: |
+          sed -i '' 's/^version = ".*"/version = "${{ needs.versioning.outputs.new_version }}"/' Cargo.toml
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-bundle
@@ -92,12 +138,49 @@ jobs:
         run: npm install --global create-dmg
       - name: Create DMG
         run: |
-          # Create DMG from the .app bundle
           create-dmg target/release/bundle/osx/SimpleSFTP.app || true
-          # Move the created dmg to a predictable name if needed, or find it
           mv *.dmg SimpleSFTP.dmg
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: simplesftp-macos.dmg
+          name: simplesftp-macos-dmg
           path: SimpleSFTP.dmg
+          if-no-files-found: error
+
+  release:
+    name: Create Release & Sync
+    needs: [versioning, build-deb-amd64, build-deb-arm64, build-macos]
+    if: needs.versioning.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+          
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: simplesftp-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.versioning.outputs.new_version }}
+          name: Release v${{ needs.versioning.outputs.new_version }}
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Commit Back Version Bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Update local file to match what we released
+          sed -i 's/^version = ".*"/version = "${{ needs.versioning.outputs.new_version }}"/' Cargo.toml
+          
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${{ needs.versioning.outputs.new_version }} [skip ci]"
+          git push
