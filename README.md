@@ -16,9 +16,9 @@
 | **System Tray** | ✅ Implemented | Minimize to system tray running in background. |
 | **File Transfers** | ✅ Implemented | Asynchronous concurrent downloads with progress tracking. |
 | **Pause and Resume** | ✅ Implemented | Pause and resume individual downloads. |
-| **Resume Queue when Connecting** | 📅 Planned | When starting the software and click Connect, load the queue, last used remote folder and resume the queue (if the remote file is still available) |
+| **Resume Queue when Connecting** | ✅ Implemented | Auto-connects to last host, restores path, and resumes pending downloads. |
 | **Throttle Downloads** | 📅 Planned | The ability to limit the download speed |
-| **Scheduling** | 📅 Planned | The ability to schedule downloads |
+| **Scheduling** | ✅ Implemented | Define start/end times and allowed days for downloads. |
 | **File Cleanup** | 📅 Planned | Review the filenames, folder structures and perform cleanup to be consistent with the media type |
 
 ## Roadmap
@@ -34,8 +34,10 @@
     *   Asynchronous chunked downloading.
     *   Concurrent transfer limits.
     *   Pause/Resume/Cancel support.
-*   **Phase 5**: **Advanced Features**:
+*   **Phase 5 (Completed)**: **Advanced Features**:
     *   Scheduling downloads.
+    *   Auto-Connect & Session Restore.
+*   **Phase 6**: **Future Optimizations**:
     *   Bandwidth throttling.
     *   File cleanup tools.
 

@@ -29,5 +29,5 @@
     }
   },
   "last_remote_path": ".",
-  "auto_connect": false
+  "auto_connect": true
 }

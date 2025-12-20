@@ -271,12 +271,13 @@ impl SftpApp {
                     }
                     ConfigOption::Disconnect => {
                         self.is_connected = false;
+                        self.config.auto_connect = false;
+                        let _ = self.config.save();
                         self.sftp_client = None;
                         self.remote_files.clear();
                     }
                     ConfigOption::Exit => {
                         self.config.last_remote_path = self.current_remote_path.clone();
-                        self.config.auto_connect = self.is_connected;
                         let _ = self.config.save();
                         save_queue(&self.queue_items);
                         return iced::exit();
@@ -305,10 +306,13 @@ impl SftpApp {
                     Ok(client) => {
                         let _ = self.config.save();
                         self.is_connected = true;
+                        self.config.auto_connect = true;
                         self.sftp_client = Some(client.clone());
                         self.app_error = None; // clear error
                         self.state = AppState::MainView;
                         self.status_message = "Connected. Restoring session...".into();
+                        // Save config immediately to persist connection state
+                        let _ = self.config.save();
 
                         println!(
                             "DEBUG: ConnectionResult - Last Path: '{}'",
@@ -804,7 +808,6 @@ impl SftpApp {
                             }
                             TrayAction::Exit => {
                                 self.config.last_remote_path = self.current_remote_path.clone();
-                                self.config.auto_connect = self.is_connected;
                                 let _ = self.config.save();
                                 save_queue(&self.queue_items);
                                 return iced::exit();
@@ -905,7 +908,6 @@ impl SftpApp {
                 if let iced::Event::Window(iced::window::Event::CloseRequested) = event {
                     println!("DEBUG: Window Close Requested. Saving config...");
                     self.config.last_remote_path = self.current_remote_path.clone();
-                    self.config.auto_connect = self.is_connected;
                     match self.config.save() {
                         Ok(_) => println!(
                             "DEBUG: Config saved successfully. Path: {}",
