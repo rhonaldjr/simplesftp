@@ -14,7 +14,7 @@ permissions:
 jobs:
   check:
     name: Check & Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -30,7 +30,7 @@ jobs:
     name: Calculate Version
     needs: check
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
     steps:
@@ -61,7 +61,7 @@ jobs:
     # Run if versioning succeeded (push to main) OR if manually dispatched/other triggers if desired
     # For now, simplistic dependency: if versioning runs, it provides the version.
     if: needs.versioning.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Update Cargo.toml Version
@@ -86,7 +86,7 @@ jobs:
     name: Build Debian Package (arm64/RPi)
     needs: versioning
     if: needs.versioning.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -105,10 +105,12 @@ jobs:
           githubToken: ${{ github.token }}
           install: |
             apt-get update
-            apt-get install -y curl build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+            apt-get install -y curl build-essential pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev clang lld
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           run: |
             source $HOME/.cargo/env
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
             cargo install cargo-deb
             cargo deb
       - name: Upload Artifact
@@ -151,7 +153,7 @@ jobs:
     name: Create Release & Sync
     needs: [versioning, build-deb-amd64, build-deb-arm64, build-macos]
     if: needs.versioning.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
