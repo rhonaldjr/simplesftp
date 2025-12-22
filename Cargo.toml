@@ -1,6 +1,6 @@
 [package]
 name = "simplesftp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 default-run = "simplesftp"
 description = "A simple SFTP client"
@@ -36,7 +36,7 @@ assets = [
 [package.metadata.bundle]
 name = "SimpleSFTP"
 identifier = "com.simplesftp.app"
-version = "0.1.1"
+version = "0.1.2"
 copyright = "Copyright 2026 Rhonald John Rose"
 category = "Productivity"
 short_description = "A simple SFTP client written in Rust"
