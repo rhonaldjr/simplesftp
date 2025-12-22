@@ -1,11 +1,10 @@
-mod components;
 mod download_manager;
-mod mock_data;
 mod scheduler;
 mod settings;
 mod sftp_client;
 mod style;
 mod tray;
+mod types;
 
 use download_manager::{DownloadCommand, DownloadEvent};
 use iced::widget::{
@@ -13,11 +12,11 @@ use iced::widget::{
     radio, row, scrollable, stack, text, text_input, vertical_space,
 };
 use iced::{Element, Length, Task, Theme};
-use mock_data::{FileType, QueueItem, RemoteFile, TransferStatus};
 use scheduler::Scheduler;
 use settings::AppConfig;
 use sftp_client::SftpClient;
 use tray::{TrayAction, TrayManager};
+use types::{FileType, QueueItem, RemoteFile, TransferStatus};
 
 use chrono::Local;
 use std::sync::{Arc, Mutex};
@@ -104,7 +103,13 @@ fn save_queue(queue: &[QueueItem]) {
 fn load_queue() -> Vec<QueueItem> {
     if let Ok(file) = File::open("queue.json") {
         let reader = BufReader::new(file);
-        if let Ok(items) = serde_json::from_reader(reader) {
+        if let Ok(mut items) = serde_json::from_reader::<_, Vec<QueueItem>>(reader) {
+            // Reset any "Downloading" items to "Pending" so they resume
+            for item in &mut items {
+                if item.status == TransferStatus::Downloading {
+                    item.status = TransferStatus::Pending;
+                }
+            }
             return items;
         }
     }
@@ -176,14 +181,14 @@ enum Message {
     // Local Navigation
     SelectDownloadPath,
     DownloadPathSelected(Option<std::path::PathBuf>),
-    RemoteFileDoubleClicked(String),
+    // RemoteFileDoubleClicked(String),
     // Hover & Actions
     HoverFile(String),
     UnhoverFile,
     QueueFile(RemoteFile),
     DownloadFile(RemoteFile),
     // Scan result (auto_start)
-    ScanResult(Result<Vec<RemoteFile>, String>, bool),
+    ScanResult(Result<Vec<RemoteFile>, String>, bool, Option<String>),
     // Queue Persistence & Resume
     ResumeQueue,
     QueueVerificationResult(Vec<(String, bool, u64)>),
@@ -217,7 +222,7 @@ enum Message {
     // Schedule
     ScheduleModeChanged(settings::ScheduleMode),
     ScheduleStartTimeChanged(u8, u8),
-    Tick(Instant), // Periodic check
+    Tick(()), // Periodic check
     ScheduleEndTimeChanged(u8, u8),
     ScheduleDayToggled(u8), // 0=Mon, 6=Sun
     SaveSchedule,
@@ -506,7 +511,7 @@ impl SftpApp {
                     self.is_scanning_queue = true;
                     let file_clone = file.clone();
                     return Task::future(async move {
-                        Message::ScanResult(Ok(vec![file_clone]), false)
+                        Message::ScanResult(Ok(vec![file_clone]), false, None)
                     });
                 }
 
@@ -516,6 +521,7 @@ impl SftpApp {
                 let client = self.sftp_client.clone();
                 let path = file.path.clone();
                 let file_clone = file.clone(); // Clone file for the `Ok(vec![file_clone])` case
+                let root_path = file.path.clone(); // Root folder path
 
                 return Task::future(async move {
                     let res = tokio::task::spawn_blocking(move || {
@@ -530,7 +536,7 @@ impl SftpApp {
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()));
 
-                    Message::ScanResult(res, false) // auto_start = false
+                    Message::ScanResult(res, false, Some(root_path)) // auto_start = false
                 });
             }
             Message::DownloadFile(file) => {
@@ -538,9 +544,9 @@ impl SftpApp {
                 if file.file_type == FileType::File {
                     self.is_scanning_queue = true;
                     let file_clone = file.clone();
-                    return Task::future(
-                        async move { Message::ScanResult(Ok(vec![file_clone]), true) },
-                    );
+                    return Task::future(async move {
+                        Message::ScanResult(Ok(vec![file_clone]), true, None)
+                    });
                 }
 
                 // Recursively scan path
@@ -549,6 +555,7 @@ impl SftpApp {
                 let client = self.sftp_client.clone();
                 let path = file.path.clone();
                 let file_clone = file.clone();
+                let root_path = file.path.clone();
 
                 return Task::future(async move {
                     let res = tokio::task::spawn_blocking(move || {
@@ -562,7 +569,7 @@ impl SftpApp {
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()));
 
-                    Message::ScanResult(res, true) // auto_start = true
+                    Message::ScanResult(res, true, Some(root_path)) // auto_start = true
                 });
             }
             Message::RefreshRemote => {
@@ -587,16 +594,50 @@ impl SftpApp {
                 self.queue_items = load_queue();
                 return Task::done(Message::ResumeQueue);
             }
-            Message::ScanResult(result, auto_start) => {
+            Message::ScanResult(result, auto_start, root_path) => {
                 self.is_scanning_queue = false;
-                println!("DEBUG: ScanResult received. Auto-start: {}", auto_start);
                 match result {
                     Ok(files) => {
-                        println!("DEBUG: Found {} files.", files.len());
+                        let base_local_path = self.config.local_download_path.clone();
+
                         for file in files {
                             if !self.queue_items.iter().any(|i| i.remote_file == file.path) {
+                                let mut local_location = base_local_path.clone();
+
+                                // If we have a root_path, we need to calculate the relative path
+                                if let Some(root) = &root_path {
+                                    // root is e.g. /mnt/remote/Movies
+                                    // file.path is /mnt/remote/Movies/Action/DieHard.mkv
+                                    // we want local_location to be .../Downloads/Movies/Action/
+                                    // filename is DieHard.mkv
+
+                                    let root_path_obj = std::path::Path::new(root);
+                                    let file_path_obj = std::path::Path::new(&file.path);
+
+                                    // Get the parent of the root (so we include the root directory itself in the download)
+                                    // e.g. /mnt/remote/Movies -> parent is /mnt/remote.
+                                    // relative path of file to /mnt/remote is Movies/Action/DieHard.mkv
+                                    if let Some(parent) = root_path_obj.parent() {
+                                        if let Ok(relative) = file_path_obj.strip_prefix(parent) {
+                                            if let Some(parent_dir) = relative.parent() {
+                                                // relative is Movies/Action/DieHard.mkv
+                                                // parent_dir is Movies/Action
+                                                // We append this to the user's local path
+                                                let relative_str = parent_dir.to_string_lossy();
+                                                if !relative_str.is_empty() {
+                                                    let new_base =
+                                                        std::path::Path::new(&base_local_path)
+                                                            .join(parent_dir);
+                                                    local_location =
+                                                        new_base.to_string_lossy().to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let item = QueueItem {
-                                    local_location: self.config.local_download_path.clone(),
+                                    local_location,
                                     filename: file.name,
                                     remote_file: file.path,
                                     size_bytes: file.size_bytes,
@@ -605,18 +646,13 @@ impl SftpApp {
                                     status: TransferStatus::Pending,
                                 };
                                 self.queue_items.push(item.clone());
-                                println!("DEBUG: Added item to queue: {}", item.filename);
+                                // println!("DEBUG: Added item to queue: {}", item.filename);
 
                                 // If downloading is active, send the item to the manager immediately
                                 if self.is_downloading {
                                     if let Some(tx) = &self.download_tx {
-                                        // Always add to manager if it's running. It will handle queueing/starting.
-                                        match tx.try_send(DownloadCommand::AddItem(item)) {
-                                            Ok(_) => println!("DEBUG: Sent AddItem to manager"),
-                                            Err(e) => {
-                                                println!("DEBUG: Failed to send AddItem: {}", e)
-                                            }
-                                        }
+                                        // Always add to manager if it's active. It will handle queueing/starting.
+                                        let _ = tx.try_send(DownloadCommand::AddItem(item));
                                     }
                                 }
                             } else {
@@ -1216,15 +1252,54 @@ impl SftpApp {
         .spacing(5)
         .padding(5);
 
-        let headers = components::table_header(vec![
-            "Local Location",
-            "File name",
-            "Remote file",
-            "Downloaded",
-            "Remaining",
-            "Priority",
-            "Progress",
-        ]);
+        // Manual header with portions to match content
+        let headers = container(
+            row![
+                container(
+                    text("Local Location")
+                        .size(12)
+                        .font(iced::font::Font::MONOSPACE)
+                )
+                .width(Length::FillPortion(2))
+                .padding(5)
+                .style(style::header_style),
+                container(text("File name").size(12).font(iced::font::Font::MONOSPACE))
+                    .width(Length::FillPortion(2))
+                    .padding(5)
+                    .style(style::header_style),
+                container(
+                    text("Remote file")
+                        .size(12)
+                        .font(iced::font::Font::MONOSPACE)
+                )
+                .width(Length::FillPortion(2))
+                .padding(5)
+                .style(style::header_style),
+                container(
+                    text("Downloaded")
+                        .size(12)
+                        .font(iced::font::Font::MONOSPACE)
+                )
+                .width(Length::FillPortion(1))
+                .padding(5)
+                .style(style::header_style),
+                container(text("Remaining").size(12).font(iced::font::Font::MONOSPACE))
+                    .width(Length::FillPortion(1))
+                    .padding(5)
+                    .style(style::header_style),
+                container(text("Priority").size(12).font(iced::font::Font::MONOSPACE))
+                    .width(Length::FillPortion(1))
+                    .padding(5)
+                    .style(style::header_style),
+                container(text("Progress").size(12).font(iced::font::Font::MONOSPACE))
+                    .width(Length::FillPortion(1))
+                    .padding(5)
+                    .style(style::header_style),
+            ]
+            .spacing(1),
+        )
+        .padding(5)
+        .style(style::header_style);
 
         let items = column(
             self.queue_items
@@ -1234,7 +1309,10 @@ impl SftpApp {
                     let remote_file = item.remote_file.clone();
 
                     let row_content = row![
+                        container(text(&item.local_location).size(12))
+                            .width(Length::FillPortion(2)),
                         container(text(&item.filename).size(12)).width(Length::FillPortion(2)),
+                        container(text(&item.remote_file).size(12)).width(Length::FillPortion(2)),
                         container(
                             text(self.format_bytes(&item.bytes_downloaded.to_string())).size(12)
                         )
@@ -1730,7 +1808,8 @@ impl SftpApp {
         };
 
         // Tick every 1 second for scheduler and stats
-        let tick_sub = iced::time::every(std::time::Duration::from_secs(1)).map(Message::Tick);
+        let tick_sub =
+            iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick(()));
 
         // Listen for window events (CloseRequested)
         let event_sub = iced::event::listen().map(Message::Event);

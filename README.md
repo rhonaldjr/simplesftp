@@ -21,6 +21,7 @@
 | **Scheduling** | ✅ Implemented | Define start/end times and allowed days for downloads. |
 | **Download Statistics** | ✅ Implemented | Track daily bytes and calculate weekly/monthly averages. |
 | **Refresh & Speed** | ✅ Implemented | Refresh remote/queue and see live download speed in status bar. |
+| **Change Download Priority** | 🕒 Planned | Ability to reorder queue items and change download priority. |
 
 ## Roadmap
 
@@ -43,6 +44,7 @@
     *   Download Statistics (Daily/Weekly/Monthly).
     *   Process Refresh (Remote & Queue).
     *   Live Download Speed Display.
+*   **Change Download Priority** (Planned).
 
 ## How to Run
 

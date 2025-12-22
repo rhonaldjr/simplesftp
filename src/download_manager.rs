@@ -1,6 +1,6 @@
-use crate::mock_data::{QueueItem, TransferStatus};
 use crate::settings::SftpConfig;
 use crate::sftp_client::SftpClient;
+use crate::types::{QueueItem, TransferStatus};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -177,6 +177,16 @@ impl DownloadManager {
             if let Some(item) = next_item {
                 let remote_file = item.remote_file.clone();
                 let local_path = format!("{}/{}", item.local_location, item.filename);
+
+                // Ensure directory exists
+                if let Err(e) = std::fs::create_dir_all(&item.local_location) {
+                    println!(
+                        "ERROR: Failed to create directory {}: {}",
+                        item.local_location, e
+                    );
+                    // Should probably fail the item here, but for now we'll let download_file fail
+                }
+
                 let config = self.config.clone();
                 let event_tx = self.event_tx.clone();
 
@@ -186,8 +196,14 @@ impl DownloadManager {
                     None => item.bytes_downloaded,
                 };
 
-                // Auto-resume logic
-                if offset == 0 {
+                let path_exists = std::path::Path::new(&local_path).exists();
+
+                // If file is missing locally, we MUST restart from 0, regardless of what the queue says
+                if !path_exists {
+                    offset = 0;
+                }
+                // Auto-resume logic if file exists
+                else if offset == 0 {
                     if let Ok(metadata) = std::fs::metadata(&local_path) {
                         let file_size = metadata.len();
                         if file_size > 0 && file_size < item.size_bytes {

@@ -1,5 +1,5 @@
-use crate::mock_data::{FileType, RemoteFile};
 use crate::settings::SftpConfig;
+use crate::types::{FileType, RemoteFile};
 
 const KB: u64 = 1024;
 const MB: u64 = KB * 1024;
@@ -268,6 +268,7 @@ impl SftpClient {
         Ok(bytes_read)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, path: &Path) -> Result<(), String> {
         // Try to remove as file first, then as directory
         // Alternatively check stat first

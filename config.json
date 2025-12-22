@@ -30,6 +30,12 @@
   },
   "last_remote_path": ".",
   "auto_connect": true,
-  "max_download_speed": 100,
-  "download_stats": []
+  "max_download_speed": 0,
+  "download_stats": [
+    {
+      "date": "2025-12-21",
+      "bytes_downloaded": 4665874,
+      "seconds_active": 40
+    }
+  ]
 }
