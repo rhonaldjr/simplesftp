@@ -80,6 +80,9 @@ struct SftpApp {
     tray_manager: Option<TrayManager>,
     last_schedule_allowed: bool,
     status_message: String,
+    // Speed Tracking
+    current_download_speed: u64,
+    bytes_downloaded_since_last_tick: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +144,8 @@ impl Default for SftpApp {
             tray_manager: None,
             last_schedule_allowed: true,
             status_message: String::new(),
+            current_download_speed: 0,
+            bytes_downloaded_since_last_tick: 0,
         }
     }
 }
@@ -184,6 +189,8 @@ enum Message {
     QueueVerificationResult(Vec<(String, bool, u64)>),
     // Remote
     RefreshRemote,
+    // Queue
+    RefreshQueue,
     // Pane
     PaneResized(pane_grid::ResizeEvent),
     // Downloads
@@ -219,6 +226,8 @@ enum Message {
     NoOp,
     // Window Events
     Event(iced::Event),
+    // Speed Limit
+    SpeedLimitChanged(String),
 }
 
 #[derive(Debug, Clone)]
@@ -574,6 +583,10 @@ impl SftpApp {
                     });
                 }
             }
+            Message::RefreshQueue => {
+                self.queue_items = load_queue();
+                return Task::done(Message::ResumeQueue);
+            }
             Message::ScanResult(result, auto_start) => {
                 self.is_scanning_queue = false;
                 println!("DEBUG: ScanResult received. Auto-start: {}", auto_start);
@@ -750,6 +763,12 @@ impl SftpApp {
                     .iter_mut()
                     .find(|i| i.remote_file == remote_file)
                 {
+                    // Calculate delta
+                    if bytes_downloaded > item.bytes_downloaded {
+                        let delta = bytes_downloaded - item.bytes_downloaded;
+                        self.config.add_daily_stat(delta, 0);
+                        self.bytes_downloaded_since_last_tick += delta;
+                    }
                     item.bytes_downloaded = bytes_downloaded;
                     item.status = TransferStatus::Downloading;
                 }
@@ -867,6 +886,20 @@ impl SftpApp {
                 let now = Local::now();
                 let allowed = Scheduler::is_allowed(&self.config.schedule, now);
 
+                // Speed Calculation
+                self.current_download_speed = self.bytes_downloaded_since_last_tick;
+                self.bytes_downloaded_since_last_tick = 0;
+
+                // Stats: Add 1 second if we are downloading
+                if self.is_downloading
+                    && self
+                        .queue_items
+                        .iter()
+                        .any(|i| i.status == TransferStatus::Downloading)
+                {
+                    self.config.add_daily_stat(0, 1);
+                }
+
                 if allowed != self.last_schedule_allowed {
                     self.last_schedule_allowed = allowed;
                     if let Some(tx) = &self.download_tx {
@@ -918,6 +951,26 @@ impl SftpApp {
                     save_queue(&self.queue_items);
                     return iced::exit();
                 }
+            }
+            Message::SpeedLimitChanged(val) => {
+                // Allow empty string for backspace
+                if val.is_empty() {
+                    self.config.max_download_speed = 0;
+                } else if let Ok(speed) = val.parse::<u64>() {
+                    self.config.max_download_speed = speed;
+                }
+
+                // Update active manager if running
+                if let Some(tx) = &self.download_tx {
+                    let _ = tx.try_send(DownloadCommand::SetSpeedLimit(
+                        self.config.max_download_speed,
+                    ));
+                }
+                // Auto-save config on change? Maybe too frequent.
+                // Let's save on exit or explicit save.
+                // But for "Speed Limit" it feels like a live toggle.
+                // Let's save config roughly.
+                let _ = self.config.save();
             }
             _ => {}
         }
@@ -1028,8 +1081,17 @@ impl SftpApp {
             ""
         };
 
+        let speed_text = if self.is_downloading {
+            format!(
+                " | Speed: {}/s",
+                self.format_bytes(&self.current_download_speed.to_string())
+            )
+        } else {
+            "".to_string()
+        };
+
         let status_text = format!(
-            "{}Total Queued: {} ({}){}{}",
+            "{}Total Queued: {} ({}){}{}{}",
             if self.status_message.is_empty() {
                 String::new()
             } else {
@@ -1038,7 +1100,8 @@ impl SftpApp {
             total_queued,
             total_size_str,
             scanning_text,
-            schedule_text
+            schedule_text,
+            speed_text
         );
 
         let status_bar = container(text(status_text).size(12))
@@ -1143,6 +1206,9 @@ impl SftpApp {
         let toolbar = row![
             text("Queue").size(18),
             horizontal_space(),
+            button(text("Refresh").size(12))
+                .on_press(Message::RefreshQueue)
+                .style(button::secondary),
             start_btn,
             pause_resume_btn,
             remove_btn,
@@ -1222,12 +1288,16 @@ impl SftpApp {
             ))
             .size(16),
             horizontal_space(),
-            button("Up")
+            button(text("Refresh").size(12))
+                .on_press(Message::RefreshRemote)
+                .style(button::secondary),
+            button(text("Up").size(12))
                 .on_press(Message::GoToParent)
                 .style(button::secondary)
         ]
         .padding(5)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center)
+        .spacing(5);
 
         let headers = container(
             row![
@@ -1382,12 +1452,32 @@ impl SftpApp {
             ]
             .spacing(20);
 
+            let weekly_avg = self.config.get_weekly_average();
+            let monthly_avg = self.config.get_monthly_average();
+            let weekly_str = self.format_bytes(&weekly_avg.to_string());
+            let monthly_str = self.format_bytes(&monthly_avg.to_string());
+
             let mut col = column![
                 title,
-                text("SFTP Connection Details"),
+                text("SFTP Connection Details").size(18),
                 host_row,
                 user_input,
                 pass_input,
+                vertical_space().height(10),
+                text("Download Settings").size(18),
+                row![
+                    text("Max Speed (KB/s, 0=Unlimited):"),
+                    text_input("0", &self.config.max_download_speed.to_string())
+                        .on_input(Message::SpeedLimitChanged)
+                        .width(100)
+                        .padding(5)
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+                vertical_space().height(10),
+                text("Statistics").size(18),
+                text(format!("Weekly Average: {}/s", weekly_str)),
+                text(format!("Monthly Average: {}/s", monthly_str)),
             ];
 
             if let Some(err) = &self.settings_error {
@@ -1602,8 +1692,10 @@ impl SftpApp {
 
     fn start_manager(&mut self) -> Task<Message> {
         if self.download_tx.is_none() {
-            let (tx, rx) =
-                download_manager::create_download_manager(self.config.sftp_config.clone());
+            let (tx, rx) = download_manager::create_download_manager(
+                self.config.sftp_config.clone(),
+                self.config.max_download_speed,
+            );
             self.download_tx = Some(tx.clone());
             self.download_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
             self.is_downloading = true;
@@ -1637,8 +1729,8 @@ impl SftpApp {
             iced::Subscription::none()
         };
 
-        // Tick every 60 seconds for scheduler
-        let tick_sub = iced::time::every(std::time::Duration::from_secs(60)).map(Message::Tick);
+        // Tick every 1 second for scheduler and stats
+        let tick_sub = iced::time::every(std::time::Duration::from_secs(1)).map(Message::Tick);
 
         // Listen for window events (CloseRequested)
         let event_sub = iced::event::listen().map(Message::Event);

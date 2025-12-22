@@ -6,3 +6,4 @@ Terminal=false
 Type=Application
 Categories=Network;FileTransfer;Utility;
 Keywords=sftp;file;transfer;
+Icon=simplesftp

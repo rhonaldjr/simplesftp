@@ -17,9 +17,10 @@
 | **File Transfers** | ✅ Implemented | Asynchronous concurrent downloads with progress tracking. |
 | **Pause and Resume** | ✅ Implemented | Pause and resume individual downloads. |
 | **Resume Queue when Connecting** | ✅ Implemented | Auto-connects to last host, restores path, and resumes pending downloads. |
-| **Throttle Downloads** | 📅 Planned | The ability to limit the download speed |
+| **Throttle Downloads** | ✅ Implemented | Limit max download speed (KB/s). |
 | **Scheduling** | ✅ Implemented | Define start/end times and allowed days for downloads. |
-| **File Cleanup** | 📅 Planned | Review the filenames, folder structures and perform cleanup to be consistent with the media type |
+| **Download Statistics** | ✅ Implemented | Track daily bytes and calculate weekly/monthly averages. |
+| **Refresh & Speed** | ✅ Implemented | Refresh remote/queue and see live download speed in status bar. |
 
 ## Roadmap
 
@@ -37,9 +38,11 @@
 *   **Phase 5 (Completed)**: **Advanced Features**:
     *   Scheduling downloads.
     *   Auto-Connect & Session Restore.
-*   **Phase 6**: **Future Optimizations**:
+*   **Phase 6 (Completed)**: **Optimization & Polish**:
     *   Bandwidth throttling.
-    *   File cleanup tools.
+    *   Download Statistics (Daily/Weekly/Monthly).
+    *   Process Refresh (Remote & Queue).
+    *   Live Download Speed Display.
 
 ## How to Run
 
@@ -58,6 +61,7 @@ cargo run
 
 *   **Remote Navigation**: Double-clicking certain remote folders might throw a **"Permission denied"** error or fail to list contents, whereas other clients (e.g., FileZilla) work fine. 
     *   *Note*: Recent updates have introduced path resolution (`realpath`) to mitigate this by ensuring canonical paths are used, but some edge cases with specific server configurations or permissions may persist.
+*   **Minimize to Tray**: The "Minimize to Tray" feature is currently experiencing issues where the application may not correctly hide to the tray or restore from it on certain Linux distributions/Desktop Environments.
 
 ## Technologies
 

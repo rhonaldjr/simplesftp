@@ -29,5 +29,7 @@
     }
   },
   "last_remote_path": ".",
-  "auto_connect": true
+  "auto_connect": true,
+  "max_download_speed": 100,
+  "download_stats": []
 }

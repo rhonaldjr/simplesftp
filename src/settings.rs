@@ -10,6 +10,17 @@ pub struct AppConfig {
     pub last_remote_path: String,
     #[serde(default)]
     pub auto_connect: bool,
+    #[serde(default)]
+    pub max_download_speed: u64, // KB/s, 0 = unlimited
+    #[serde(default)]
+    pub download_stats: Vec<DailyStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyStat {
+    pub date: String, // YYYY-MM-DD
+    pub bytes_downloaded: u64,
+    pub seconds_active: u64,
 }
 
 impl Default for AppConfig {
@@ -25,6 +36,8 @@ impl Default for AppConfig {
             schedule: ScheduleConfig::default(),
             last_remote_path: ".".to_string(),
             auto_connect: false,
+            max_download_speed: 0,
+            download_stats: Vec::new(),
         }
     }
 }
@@ -113,5 +126,48 @@ impl AppConfig {
     pub fn save(&self) -> std::io::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write("config.json", content)
+    }
+
+    pub fn get_today_stat(&mut self) -> &mut DailyStat {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        if self.download_stats.is_empty() || self.download_stats.last().unwrap().date != today {
+            self.download_stats.push(DailyStat {
+                date: today,
+                bytes_downloaded: 0,
+                seconds_active: 0,
+            });
+        }
+        self.download_stats.last_mut().unwrap()
+    }
+
+    pub fn add_daily_stat(&mut self, bytes: u64, seconds: u64) {
+        let stat = self.get_today_stat();
+        stat.bytes_downloaded += bytes;
+        stat.seconds_active += seconds;
+    }
+
+    pub fn get_weekly_average(&self) -> u64 {
+        self.get_average_speed(7)
+    }
+
+    pub fn get_monthly_average(&self) -> u64 {
+        self.get_average_speed(30)
+    }
+
+    fn get_average_speed(&self, days: usize) -> u64 {
+        if self.download_stats.is_empty() {
+            return 0;
+        }
+        let start_idx = self.download_stats.len().saturating_sub(days);
+        let stats = &self.download_stats[start_idx..];
+
+        let total_bytes: u64 = stats.iter().map(|s| s.bytes_downloaded).sum();
+        let total_seconds: u64 = stats.iter().map(|s| s.seconds_active).sum();
+
+        if total_seconds == 0 {
+            0
+        } else {
+            total_bytes / total_seconds // Bytes per second
+        }
     }
 }
